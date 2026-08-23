@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>WatchHistory for YouTube™ - Options</title>
+  <link rel="stylesheet" href="theme.css">
+  <script src="libraries/webextension-polyfill.js"></script>
+  <style>
+    .options-container {
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 32px 20px;
+    }
+
+    .panel+.panel {
+      margin-top: 16px;
+    }
+
+    .panel-row+.panel-row {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .panel-row label {
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .panel-row .help-text {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .about-section {
+      text-align: center;
+      padding: 20px;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    .about-section .version {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Header -->
+  <div class="page-header">
+    <div class="logo">
+      <div class="logo-icon">WHYT</div>
+      <div class="logo-text">WatchHistory <span>for YouTube™</span></div>
+    </div>
+    <nav class="nav-tabs">
+      <a href="history.html" class="nav-tab">History</a>
+      <a href="stats.html" class="nav-tab">Stats</a>
+      <a href="options.html" class="nav-tab active">Options</a>
+      <a href="https://www.youtube.com" class="nav-tab" target="_blank" rel="noopener noreferrer">YouTube</a>
+    </nav>
+  </div>
+
+  <div class="options-container">
+    <!-- Welcome Card (First Time Setup) -->
+    <div id="welcomeCard"
+      style="display:none; background:var(--bg-card); border:1px solid var(--border-color); border-radius:var(--radius-lg); padding:20px; margin-bottom:20px; box-shadow:var(--shadow-card);">
+      <div style="font-size:15px; font-weight:700; margin-bottom:12px; color:var(--text-primary);">Welcome to
+        WatchHistory for YouTube™</div>
+      <div style="font-size:13px; color:var(--text-secondary); line-height:1.6; margin-bottom:16px;">Welcome to your
+        personal YouTube archive! Thanks for installing. We are excited to help you track your watch progress. We have
+        pre-selected the best settings for you, but feel free to adjust your history limits and preferences below so
+        everything is perfectly tailored to your watching habits.</div>
+      <button id="dismissWelcome" class="btn btn-sm btn-primary" style="align-self:flex-start;">Dismiss</button>
+    </div>
+
+    <!-- Display Settings -->
+    <div class="panel">
+      <div class="panel-title">Display</div>
+      <div class="panel-description">Control how the extension appears on YouTube.</div>
+      <div class="panel-row">
+        <div>
+          <label>Resume badges</label>
+          <div class="help-text">Show a "Resume" tag on thumbnails for videos in your history.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="badge-toggle" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Redirect YouTube history</label>
+          <div class="help-text">Redirect youtube.com/feed/history to your local watch history page.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="redirect-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Redirect Home & Shorts to Subscriptions</label>
+          <div class="help-text">Skip recommendations - redirect the YouTube home page and Shorts to your subscriptions
+            feed.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="subs-redirect-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Hide Shorts</label>
+          <div class="help-text">Hide Shorts from all YouTube feeds including home, subscriptions and search.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="hide-shorts-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Hide watched in search</label>
+          <div class="help-text">Hide watched videos by default on the history search page.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="hide-watched-default-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Subscriptions "Continue Watching" shelf</label>
+          <div class="help-text">Show a "Continue Watching" row at the top of your Subscriptions feed.</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="pickup-shelf-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Watch Settings</div>
+      <div class="panel-description">Control how you interact with videos</div>
+      <div class="panel-row">
+        <div>
+          <label>Watched threshold</label>
+          <div class="help-text">How far through a video (%) must be watched before it counts as watched. Default: 95%.
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <input type="number" id="watched-threshold-input" class="input" min="1" max="100" value="95"
+            style="width:64px; text-align:center; padding:6px 8px;">
+          <span style="font-size:13px; color:var(--text-secondary);">%</span>
+        </div>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Count background YouTube playback</label>
+          <div class="help-text">When enabled, playing YouTube videos continue to count when this tab is hidden. This includes music, podcasts, livestreams, and regular videos.</div>
+        </div>
+        <label class="toggle" aria-label="Count background YouTube playback">
+          <input type="checkbox" id="background-playback-toggle">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+    <!-- Ghost Mode -->
+    <div class="panel">
+      <div class="panel-title">Ghost Mode (Incognito)</div>
+      <div class="panel-description">When enabled, the extension will stop tracking watch progress and history. Note:
+        This setting is session-based and will automatically turn off when you restart your browser for your privacy and
+        convenience.</div>
+      <div class="panel-row">
+        <div>
+          <label>Enable Ghost Mode</label>
+          <div class="help-text">Session-only privacy mode for temporary tracking pause.</div>
+        </div>
+        <label class="toggle" aria-label="Ghost Mode (Incognito)">
+          <input type="checkbox" id="ghostModeOptions">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Data Management -->
+    <div class="panel">
+      <div class="panel-title">Data</div>
+      <div class="panel-description">Manage your locally stored watch history.</div>
+      <div class="panel-row">
+        <div class="help-text">
+          Data is stored locally. We are not responsible for data loss due to browser resets, cache clearing, or device
+          failure. Please back up regularly.
+        </div>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Backup reminder</label>
+          <div class="help-text">Get a reminder banner on YouTube to export your history.</div>
+        </div>
+        <select id="backup-reminder-select" class="input" style="width:auto; padding:6px 10px;">
+          <option value="never">Never</option>
+          <option value="daily">Daily</option>
+          <option value="weekly" selected>Weekly</option>
+          <option value="monthly">Monthly</option>
+        </select>
+      </div>
+      <div class="panel-row" id="yth-section">
+        <div>
+          <label>Sync daemon</label>
+          <div class="help-text">
+            Shares history with your other Chrome profile and pulls in videos you
+            liked on your phone. Run <code>yth serve</code>, then paste the token
+            it prints. Leave the token blank to disable syncing entirely.
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input id="yth-url" type="text" placeholder="http://127.0.0.1:8742"
+                   style="flex:1;min-width:200px;padding:6px 8px" />
+            <input id="yth-token" type="password" placeholder="daemon token"
+                   style="flex:1;min-width:200px;padding:6px 8px" />
+            <button id="yth-test" class="btn btn-sm">Test</button>
+          </div>
+          <div class="help-text" id="yth-status" style="margin-top:6px"></div>
+        </div>
+      </div>
+      <div class="panel-row" id="export-section">
+        <div>
+          <label>Export history/Take Backup</label>
+          <div class="help-text">Download your history as a JSON file.</div>
+        </div>
+        <button id="export-btn" class="btn btn-sm">Export</button>
+      </div>
+      <div class="panel-row">
+        <div>
+          <label>Import history/Restore Backup</label>
+          <div class="help-text">Restore from a previously exported JSON file.</div>
+        </div>
+        <div>
+          <input type="file" id="import-file" accept=".json" class="hidden">
+          <button id="import-btn" class="btn btn-sm">Import</button>
+        </div>
+      </div>
+      <details id="import-status-menu" class="panel-row" hidden>
+        <summary id="operation-status-title">Import / Export status</summary>
+        <div id="import-status" class="help-text">Waiting to start</div>
+        <progress id="operation-progress" value="0" max="100" style="width:100%; margin-top:8px;"></progress>
+        <ol id="operation-log" class="help-text" style="margin:8px 0 0; padding-left:20px;"></ol>
+      </details>
+      <div class="panel-row">
+        <div>
+          <label class="text-red">Clear all history</label>
+          <div class="help-text">Permanently delete all saved videos. This cannot be undone.</div>
+        </div>
+        <button id="clear-btn" class="btn btn-sm btn-danger">Clear All</button>
+      </div>
+    </div>
+
+    <!-- About -->
+    <div class="about-section">
+      <div class="version">WatchHistory for YouTube™ v<span id="version-number">1.1</span></div>
+      <div>Tracks YouTube videos locally and resumes where you left off.</div>
+      <div style="margin-top: 12px;">
+        <a href="https://github.com/GeorgeElliott/yt-watch-history" target="_blank" rel="noopener noreferrer"
+          style="color: var(--accent); text-decoration: none;">View on GitHub</a>
+        <span style="margin: 0 8px; opacity: 0.4;">|</span>
+        <a href="https://github.com/GeorgeElliott/yt-watch-history/issues" target="_blank" rel="noopener noreferrer"
+          style="color: var(--accent); text-decoration: none;">Report a Bug</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <script src="db.js"></script>
+  <script src="options.js"></script>
+</body>
+
+</html>
