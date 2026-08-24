@@ -64,6 +64,8 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
         liveReplay: remote.liveReplay === true ? true : undefined,
         liked: remote.liked === true ? true : undefined,
         description: remote.description || '',
+        summary: remote.summary || '',
+        summaryState: remote.summaryState || '',
         hidden: remote.hidden === true ? true : undefined,
         timestamp: remote.timestamp || Date.now()
       }));
@@ -83,6 +85,10 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
       // The record is the only source of descriptions, so a non-empty remote
       // value always wins over a blank local one.
       description: remote.description || existing.description || '',
+      // The record owns summaries entirely; a re-summarise must be able to
+      // replace an older one, so remote wins whenever it has a value.
+      summary: remote.summary || existing.summary || '',
+      summaryState: remote.summaryState || existing.summaryState || '',
       hidden:     remote.hidden === true ? true : undefined,
       // timestamp drives History-tab sort order. Only move it forward, so a
       // video watched here last week is not shuffled to when it was liked.
@@ -193,6 +199,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         body: JSON.stringify({ videoId: message.videoId })
       }).then((r) => (r.ok ? { hidden: true } : { error: 'HTTP ' + r.status }));
     }).then(sendResponse).catch((e) => sendResponse({ error: String(e) }));
+    return true;
+  }
+
+  if (message.type === 'yth-summarize') {
+    // The daemon does the work: it holds the OpenRouter key, which must not be
+    // in extension storage where any page script in this context could read it.
+    ythConfig().then((cfg) => {
+      if (!cfg.ythToken) return { state: 'error', error: 'Sync daemon not configured' };
+      return ythFetch(cfg, '/summarize', {
+        method: 'POST',
+        body: JSON.stringify({ videoId: message.videoId })
+      }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))));
+    }).then((result) => ythPull().then(() => result))
+      .then(sendResponse)
+      .catch((e) => sendResponse({ state: 'error', error: String(e) }));
     return true;
   }
 

@@ -223,7 +223,44 @@ const renderBatch = () => {
     };
 
     tools.appendChild(makePill('Clear', 'is-clear', () => removeVideo(video.videoId)));
-    tools.appendChild(makePill('Robert', 'is-robert', null));
+
+    const robertBtn = makePill('Robert', 'is-robert', null);
+    if (video.summaryState === 'no_transcript') {
+      robertBtn.disabled = true;
+      robertBtn.title = 'No transcript available for this video';
+    } else {
+      robertBtn.disabled = false;
+      robertBtn.title = video.summary ? 'Re-summarise the transcript'
+                                      : 'Summarise the transcript';
+      robertBtn.onclick = () => {
+        if (robertBtn.disabled) return;
+        const label = robertBtn.textContent;
+        robertBtn.disabled = true;
+        robertBtn.classList.add('is-working');
+        robertBtn.textContent = '...';
+        descEl.classList.add('is-working');
+        chrome.runtime.sendMessage(
+          { type: 'yth-summarize', videoId: video.videoId },
+          (result) => {
+            void chrome.runtime.lastError;
+            robertBtn.classList.remove('is-working');
+            robertBtn.textContent = label;
+            robertBtn.disabled = false;
+            descEl.classList.remove('is-working');
+            if (!result || result.state === 'error') {
+              showToast(`Summary failed: ${(result && result.error) || 'no response'}`);
+              return;
+            }
+            if (result.state === 'no_transcript') {
+              showToast('No transcript available for this video');
+            }
+            // The pull inside the handler has already merged the new text into
+            // IndexedDB; re-render so the column shows it.
+            loadHistoryFromDb();
+          });
+      };
+    }
+    tools.appendChild(robertBtn);
     tools.appendChild(makePill('George', 'is-george', null));
 
     const body = document.createElement('div');
@@ -254,7 +291,16 @@ const renderBatch = () => {
     // backfilled that video.
     const descEl = document.createElement('div');
     descEl.className = 'card-description';
-    if (video.description) {
+    if (video.summary) {
+      // A summary supersedes the description in this column, but the original
+      // description is kept in the record and shown on hover.
+      descEl.classList.add('is-summary');
+      descEl.textContent = video.summary;
+      descEl.title = video.description || video.summary;
+    } else if (video.summaryState === 'no_transcript') {
+      descEl.classList.add('is-empty');
+      descEl.textContent = video.description || 'No transcript available';
+    } else if (video.description) {
       descEl.textContent = video.description;
       descEl.title = video.description;
     } else {

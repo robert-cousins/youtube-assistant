@@ -628,6 +628,25 @@ a {
   text-align: left;
 }
 
+/* A summary is model-generated, not the author's text — mark it so the two are
+   never mistaken for each other. */
+.video-rows .card-description.is-summary {
+  color: var(--text-primary);
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+  -webkit-line-clamp: 4;
+}
+
+.video-rows .card-description.is-working {
+  opacity: 0.45;
+}
+
+.video-rows .pill-btn.is-working {
+  border-color: var(--accent);
+  color: var(--accent);
+  opacity: 1;
+}
+
 .video-rows .card-description.is-empty {
   color: var(--text-disabled);
   font-style: italic;
