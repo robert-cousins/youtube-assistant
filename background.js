@@ -63,6 +63,7 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
         live: remote.live === true ? true : undefined,
         liveReplay: remote.liveReplay === true ? true : undefined,
         liked: remote.liked === true ? true : undefined,
+        description: remote.description || '',
         hidden: remote.hidden === true ? true : undefined,
         timestamp: remote.timestamp || Date.now()
       }));
@@ -79,6 +80,9 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
       watchCount: Math.max(existing.watchCount || 0, remote.watchCount || 0),
       watched:    existing.watched === true || remote.watched === true,
       liked:      remote.liked === true ? true : existing.liked,
+      // The record is the only source of descriptions, so a non-empty remote
+      // value always wins over a blank local one.
+      description: remote.description || existing.description || '',
       hidden:     remote.hidden === true ? true : undefined,
       // timestamp drives History-tab sort order. Only move it forward, so a
       // video watched here last week is not shuffled to when it was liked.

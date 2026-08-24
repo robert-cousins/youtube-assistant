@@ -469,7 +469,11 @@ a {
 
 .video-rows .video-card {
   display: grid;
-  grid-template-columns: var(--thumb-w) minmax(0, 1fr) auto;
+  /* thumb | title block (~40 characters) | description | actions.
+     40ch is measured on the row's own font, so it tracks the type scale.
+     minmax(0, ...) on both flexible columns stops long text from stretching
+     the row instead of wrapping. */
+  grid-template-columns: var(--thumb-w) minmax(0, 40ch) minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
   padding: 8px;
@@ -546,6 +550,33 @@ a {
 .video-rows .video-card .card-menu {
   right: 0;
   top: 28px;
+}
+
+/* Description column */
+.video-rows .card-description {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* Descriptions are flattened before they reach here, so normal wrapping
+     gives three lines of actual text rather than three lines of blank gaps. */
+  white-space: normal;
+  min-width: 0;
+  text-align: left;
+}
+
+.video-rows .card-description.is-empty {
+  color: var(--text-disabled);
+  font-style: italic;
+}
+
+/* Narrower windows: drop the description first, then stack the actions. */
+@media (max-width: 1100px) {
+  .video-rows .video-card { grid-template-columns: var(--thumb-w) minmax(0, 1fr) auto; }
+  .video-rows .card-description { display: none; }
 }
 
 @media (max-width: 640px) {

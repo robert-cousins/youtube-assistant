@@ -224,6 +224,19 @@ const renderBatch = () => {
     metaDiv.textContent = date;
     body.appendChild(metaDiv);
 
+    // Description column. Populated from the shared record (the extension never
+    // captures descriptions itself), so it is blank until the daemon has
+    // backfilled that video.
+    const descEl = document.createElement('div');
+    descEl.className = 'card-description';
+    if (video.description) {
+      descEl.textContent = video.description;
+      descEl.title = video.description;
+    } else {
+      descEl.classList.add('is-empty');
+      descEl.textContent = 'No description';
+    }
+
     // Right-hand slot. Everything here is right-aligned and vertically centred;
     // add further buttons or fields by appending to actions, no layout change
     // needed. Order: status fields first, controls last.
@@ -247,6 +260,7 @@ const renderBatch = () => {
 
     card.appendChild(thumbLink);
     card.appendChild(body);
+    card.appendChild(descEl);
     card.appendChild(actions);
     container.appendChild(card);
   });
