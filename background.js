@@ -24,7 +24,8 @@ if (typeof importScripts === 'function') {
 const YTH_DEFAULT_URL = 'http://127.0.0.1:8742';
 
 const ythConfig = () => new Promise((resolve) => {
-  chrome.storage.local.get({ ythUrl: YTH_DEFAULT_URL, ythToken: '', ythCursor: 0 }, resolve);
+  chrome.storage.local.get(
+    { ythUrl: YTH_DEFAULT_URL, ythToken: '', ythCursor: 0, ythSchema: 0 }, resolve);
 });
 
 const ythFetch = (cfg, path, options = {}) => fetch(cfg.ythUrl + path, {
@@ -108,6 +109,19 @@ const ythPull = () => {
     return ythFetch(cfg, `/recent?since=${cfg.ythCursor || 0}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
       .then((data) => {
+        // The daemon stamps the payload shape. When it changes, rows this
+        // client already consumed still carry the OLD shape and would never be
+        // re-sent -- so rewind the cursor and take everything again. Without
+        // this, every newly added field needs a manual `yth resync`.
+        const schema = data.schema || 0;
+        if (schema && schema !== (cfg.ythSchema || 0)) {
+          // Rewind, then let the OUTER handler re-pull. Calling ythPull() here
+          // would hit the re-entrancy guard and return this very promise, which
+          // would then be awaiting itself.
+          return new Promise((resolve) => {
+            chrome.storage.local.set({ ythSchema: schema, ythCursor: 0 }, resolve);
+          }).then(() => ({ schemaChanged: schema, merged: 0 }));
+        }
         const videos = data.videos || [];
         return videos.reduce(
           (chain, v) => chain.then(() => ythMergeVideo(v)), Promise.resolve()
@@ -130,7 +144,7 @@ const ythPull = () => {
   }).catch((error) => ({ error: String(error) }))
     .then((result) => {
       ythPulling = null;
-      if (result && result.more) return ythPull();
+      if (result && (result.more || result.schemaChanged)) return ythPull();
       return result;
     });
   return ythPulling;
