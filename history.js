@@ -289,6 +289,11 @@ const renderBatch = () => {
     // Description column. Populated from the shared record (the extension never
     // captures descriptions itself), so it is blank until the daemon has
     // backfilled that video.
+    // The footer lives outside the clamped text: -webkit-line-clamp would
+    // otherwise swallow it exactly when the summary is long enough to need it.
+    const descWrap = document.createElement('div');
+    descWrap.className = 'card-desc-wrap';
+
     const descEl = document.createElement('div');
     descEl.className = 'card-description';
     if (video.summary) {
@@ -306,6 +311,14 @@ const renderBatch = () => {
     } else {
       descEl.classList.add('is-empty');
       descEl.textContent = 'No description';
+    }
+
+    descWrap.appendChild(descEl);
+    if (video.summary && video.summaryMeta) {
+      const metaEl = document.createElement('div');
+      metaEl.className = 'summary-meta';
+      metaEl.textContent = video.summaryMeta;
+      descWrap.appendChild(metaEl);
     }
 
     // Right-hand slot. Everything here is right-aligned and vertically centred;
@@ -332,7 +345,7 @@ const renderBatch = () => {
     card.appendChild(thumbLink);
     card.appendChild(tools);
     card.appendChild(body);
-    card.appendChild(descEl);
+    card.appendChild(descWrap);
     card.appendChild(actions);
     container.appendChild(card);
   });

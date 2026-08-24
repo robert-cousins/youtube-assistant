@@ -66,6 +66,7 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
         description: remote.description || '',
         summary: remote.summary || '',
         summaryState: remote.summaryState || '',
+        summaryMeta: remote.summaryMeta || '',
         hidden: remote.hidden === true ? true : undefined,
         timestamp: remote.timestamp || Date.now()
       }));
@@ -89,6 +90,7 @@ const ythMergeVideo = (remote) => new Promise((resolve) => {
       // replace an older one, so remote wins whenever it has a value.
       summary: remote.summary || existing.summary || '',
       summaryState: remote.summaryState || existing.summaryState || '',
+      summaryMeta: remote.summaryMeta || existing.summaryMeta || '',
       hidden:     remote.hidden === true ? true : undefined,
       // timestamp drives History-tab sort order. Only move it forward, so a
       // video watched here last week is not shuffled to when it was liked.

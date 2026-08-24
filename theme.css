@@ -612,6 +612,23 @@ a {
   transform: none;
 }
 
+/* Description column. A wrapper so the summary footer sits below the clamped
+   text rather than inside it. */
+.video-rows .card-desc-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.video-rows .summary-meta {
+  font-size: 11px;
+  color: var(--text-disabled);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Description column */
 .video-rows .card-description {
   font-size: 12px;
@@ -657,7 +674,7 @@ a {
   .video-rows .video-card {
     grid-template-columns: var(--thumb-w) auto minmax(0, 1fr) auto;
   }
-  .video-rows .card-description { display: none; }
+  .video-rows .card-desc-wrap { display: none; }
 }
 
 @media (max-width: 640px) {
