@@ -106,11 +106,25 @@ const ythPull = () => {
         ).then(() => {
           if (data.cursor) chrome.storage.local.set({ ythCursor: data.cursor });
           if (videos.length) invalidateCountCache?.();
-          return { merged: videos.length, cursor: data.cursor };
+          // A full page means more is waiting. Keep going rather than
+          // trickling one page per alarm, so a backlog (a resync, or a newly
+          // added field) clears in seconds instead of hours.
+          // Only continue if the cursor actually moved; a full page whose rows
+          // all share one timestamp would otherwise loop forever.
+          const advanced = data.cursor && data.cursor > (cfg.ythCursor || 0);
+          return {
+            merged: videos.length,
+            cursor: data.cursor,
+            more: videos.length >= 500 && advanced
+          };
         });
       });
   }).catch((error) => ({ error: String(error) }))
-    .then((result) => { ythPulling = null; return result; });
+    .then((result) => {
+      ythPulling = null;
+      if (result && result.more) return ythPull();
+      return result;
+    });
   return ythPulling;
 };
 
