@@ -483,15 +483,21 @@ document.getElementById('version-number').textContent = manifest.version;
 
 // Theme sync
 const applyStoredTheme = () => {
-  chrome.storage.local.get({ youtubeTheme: '' }, (data) => {
-    if (data.youtubeTheme) document.documentElement.dataset.theme = data.youtubeTheme;
+  chrome.storage.local.get({ youtubeTheme: '', themeMode: 'auto' }, (data) => {
+    // An explicit themeMode (set on the History page) wins; otherwise
+    // follow YouTube's own theme, as before.
+    const theme = (data.themeMode === 'light' || data.themeMode === 'dark')
+      ? data.themeMode
+      : data.youtubeTheme;
+    if (theme) document.documentElement.dataset.theme = theme;
+    else delete document.documentElement.dataset.theme;
   });
 };
 applyStoredTheme();
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.youtubeTheme) {
-    document.documentElement.dataset.theme = changes.youtubeTheme.newValue;
+  if (area === 'local' && (changes.youtubeTheme || changes.themeMode)) {
+    applyStoredTheme();
   }
 });
 

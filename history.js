@@ -384,17 +384,43 @@ document.getElementById('clear-all').onclick = () => {
   }
 };
 
+// Theme resolution: an explicit choice wins, otherwise follow YouTube's own
+// theme (content.js mirrors it into youtubeTheme). 'auto' preserves the
+// extension's original behaviour and stays the default.
+const resolveTheme = ({ themeMode, youtubeTheme }) => {
+  if (themeMode === 'light' || themeMode === 'dark') return themeMode;
+  return youtubeTheme || '';
+};
+
 const applyStoredTheme = () => {
-  chrome.storage.local.get({ youtubeTheme: '' }, (data) => {
-    if (data.youtubeTheme) document.documentElement.dataset.theme = data.youtubeTheme;
+  chrome.storage.local.get({ youtubeTheme: '', themeMode: 'auto' }, (data) => {
+    const theme = resolveTheme(data);
+    if (theme) {
+      document.documentElement.dataset.theme = theme;
+    } else {
+      // No signal either way: let the OS preference apply via CSS.
+      delete document.documentElement.dataset.theme;
+    }
+    const select = document.getElementById('theme-select');
+    if (select) select.value = data.themeMode || 'auto';
   });
 };
 applyStoredTheme();
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.youtubeTheme) {
-    document.documentElement.dataset.theme = changes.youtubeTheme.newValue;
+  if (area === 'local' && (changes.youtubeTheme || changes.themeMode)) {
+    applyStoredTheme();
   }
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  const select = document.getElementById('theme-select');
+  if (!select) return;
+  select.onchange = () => {
+    chrome.storage.local.set({ themeMode: select.value });
+    applyStoredTheme();
+  };
+  applyStoredTheme();
 });
 
 // db.js must be loaded before history.js (see history.html <script> tags).
