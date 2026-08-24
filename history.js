@@ -25,6 +25,23 @@ const formatTime = (seconds) => {
   return `${m}m ${s}s`;
 };
 
+// Removal has two callers now (the card menu and the Clear pill), and getting
+// the order wrong matters: hide in the shared record first, because a purely
+// local delete is undone by the next pull -- and for a liked video, by every
+// future likes sync.
+const removeVideo = (videoId) => {
+  chrome.runtime.sendMessage({ type: 'yth-hide', videoId }, (result) => {
+    void chrome.runtime.lastError;
+    const syncFailed = result && result.error;
+    db_deleteVideo(videoId).then(() => {
+      showToast(syncFailed
+        ? 'Removed here, but the sync daemon is unreachable - it may come back'
+        : 'Video removed');
+      loadHistory();
+    }).catch(console.error);
+  });
+};
+
 const applyFilters = () => {
   const query = searchInput.value.toLowerCase().trim();
   const sort = sortSelect.value;
@@ -164,21 +181,7 @@ const renderBatch = () => {
     const removeItem = document.createElement('button');
     removeItem.className = 'card-menu-item danger';
     removeItem.textContent = '\uD83D\uDDD1 Remove from history';
-    removeItem.onclick = () => {
-      // Hide in the shared record first. Deleting locally on its own is not
-      // enough once syncing is on -- the next pull would bring the video
-      // straight back, and for a liked video every future likes sync would too.
-      chrome.runtime.sendMessage({ type: 'yth-hide', videoId: video.videoId }, (result) => {
-        void chrome.runtime.lastError;
-        const syncFailed = result && result.error;
-        db_deleteVideo(video.videoId).then(() => {
-          showToast(syncFailed
-            ? 'Removed here, but the sync daemon is unreachable - it may come back'
-            : 'Video removed');
-          loadHistory();
-        }).catch(console.error);
-      });
-    };
+    removeItem.onclick = () => removeVideo(video.videoId);
 
     cardMenu.appendChild(watchedItem);
     cardMenu.appendChild(copyItem);
@@ -200,6 +203,28 @@ const renderBatch = () => {
     timeBadgeEl.textContent = timeBadge;
     thumbLink.appendChild(thumbImg);
     thumbLink.appendChild(timeBadgeEl);
+
+    // Tool stack, between thumbnail and title.
+    const tools = document.createElement('div');
+    tools.className = 'card-tools';
+
+    const makePill = (label, className, onClick) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = className ? `pill-btn ${className}` : 'pill-btn';
+      btn.textContent = label;
+      if (onClick) {
+        btn.onclick = onClick;
+      } else {
+        btn.disabled = true;               // placeholder, no behaviour yet
+        btn.title = `${label} - not wired up yet`;
+      }
+      return btn;
+    };
+
+    tools.appendChild(makePill('Clear', 'is-clear', () => removeVideo(video.videoId)));
+    tools.appendChild(makePill('Robert', 'is-robert', null));
+    tools.appendChild(makePill('George', 'is-george', null));
 
     const body = document.createElement('div');
     body.className = 'card-body';
@@ -259,6 +284,7 @@ const renderBatch = () => {
     actions.appendChild(menuWrap);
 
     card.appendChild(thumbLink);
+    card.appendChild(tools);
     card.appendChild(body);
     card.appendChild(descEl);
     card.appendChild(actions);

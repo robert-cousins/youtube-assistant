@@ -473,7 +473,7 @@ a {
      40ch is measured on the row's own font, so it tracks the type scale.
      minmax(0, ...) on both flexible columns stops long text from stretching
      the row instead of wrapping. */
-  grid-template-columns: var(--thumb-w) minmax(0, 40ch) minmax(0, 1fr) auto;
+  grid-template-columns: var(--thumb-w) auto minmax(0, 40ch) minmax(0, 1fr) auto;
   gap: 14px;
   align-items: center;
   padding: 8px;
@@ -552,6 +552,66 @@ a {
   top: 28px;
 }
 
+/* Per-row tool stack, between thumbnail and title.
+   Three pills at the title's own font size, sized so the stack stays within a
+   medium thumbnail's height. */
+.video-rows .card-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+}
+
+.video-rows .pill-btn {
+  font-family: inherit;
+  font-size: 14px;              /* matches .card-title */
+  font-weight: 500;
+  line-height: 1.15;
+  padding: 2px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-light);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-align: center;
+  white-space: nowrap;
+  transition: background var(--transition), color var(--transition),
+              border-color var(--transition), transform var(--transition);
+}
+
+.video-rows .pill-btn:hover {
+  background: var(--accent-surface);
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.video-rows .pill-btn:active { transform: translateY(0); }
+
+.video-rows .pill-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Clear removes the row, so it warns on hover rather than reading as neutral. */
+.video-rows .pill-btn.is-clear:hover {
+  background: rgba(255, 77, 77, 0.12);
+  border-color: #ff4d4d;
+  color: #ff4d4d;
+}
+
+.video-rows .pill-btn[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.video-rows .pill-btn[disabled]:hover {
+  background: transparent;
+  border-color: var(--border-light);
+  color: var(--text-secondary);
+  transform: none;
+}
+
 /* Description column */
 .video-rows .card-description {
   font-size: 12px;
@@ -575,13 +635,15 @@ a {
 
 /* Narrower windows: drop the description first, then stack the actions. */
 @media (max-width: 1100px) {
-  .video-rows .video-card { grid-template-columns: var(--thumb-w) minmax(0, 1fr) auto; }
+  .video-rows .video-card {
+    grid-template-columns: var(--thumb-w) auto minmax(0, 1fr) auto;
+  }
   .video-rows .card-description { display: none; }
 }
 
 @media (max-width: 640px) {
-  .video-rows .video-card { grid-template-columns: var(--thumb-w) minmax(0, 1fr); }
-  .video-rows .card-actions { grid-column: 2; justify-content: flex-start; }
+  .video-rows .video-card { grid-template-columns: var(--thumb-w) auto minmax(0, 1fr); }
+  .video-rows .card-actions { grid-column: 3; justify-content: flex-start; }
 }
 
 /* ---- Grid Layouts ---- */
