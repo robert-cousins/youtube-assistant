@@ -233,6 +233,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'yth-email') {
+    // Summarise-if-needed then email, both done by the daemon: it holds the
+    // OpenRouter and Resend keys, and the recipient lives in its config file.
+    ythConfig().then((cfg) => {
+      if (!cfg.ythToken) return { state: 'error', error: 'Sync daemon not configured' };
+      return ythFetch(cfg, '/email-summary', {
+        method: 'POST',
+        body: JSON.stringify({ videoId: message.videoId })
+      }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))));
+    }).then((result) => ythPull().then(() => result))
+      .then(sendResponse)
+      .catch((e) => sendResponse({ state: 'error', error: String(e) }));
+    return true;
+  }
+
   if (message.type === 'yth-pull-now') {
     // The History page asks for this on load so a refresh is always current.
     ythPull().then(sendResponse);

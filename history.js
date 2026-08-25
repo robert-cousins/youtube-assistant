@@ -261,7 +261,40 @@ const renderBatch = () => {
       };
     }
     tools.appendChild(robertBtn);
-    tools.appendChild(makePill('George', 'is-george', null));
+    const georgeBtn = makePill('George', 'is-george', null);
+    if (video.summaryState === 'no_transcript') {
+      georgeBtn.disabled = true;
+      georgeBtn.title = 'No transcript available for this video';
+    } else {
+      georgeBtn.disabled = false;
+      georgeBtn.title = video.summary
+        ? 'Email the existing summary'
+        : 'Summarise, then email the summary';
+      georgeBtn.onclick = () => {
+        if (georgeBtn.disabled) return;
+        const label = georgeBtn.textContent;
+        georgeBtn.disabled = true;
+        georgeBtn.classList.add('is-working');
+        georgeBtn.textContent = '...';
+        chrome.runtime.sendMessage(
+          { type: 'yth-email', videoId: video.videoId },
+          (result) => {
+            void chrome.runtime.lastError;
+            georgeBtn.classList.remove('is-working');
+            georgeBtn.textContent = label;
+            georgeBtn.disabled = false;
+            if (!result || result.state !== 'sent') {
+              // Surfaced in full: the common failure is a Resend recipient
+              // restriction, and the message says exactly how to fix it.
+              showToast(`Email failed: ${(result && result.error) || 'no response'}`);
+              return;
+            }
+            showToast(`Summary emailed to ${result.detail.split(' ')[0]}`);
+            loadHistoryFromDb();
+          });
+      };
+    }
+    tools.appendChild(georgeBtn);
 
     const body = document.createElement('div');
     body.className = 'card-body';
