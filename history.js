@@ -228,13 +228,14 @@ const renderBatch = () => {
     // appear on the Tracked tab without needing to be watched first. Kept here
     // rather than in the card menu because the whole point is that it is a
     // one-click reaction to something you just enjoyed.
+    // channelUrl is empty for most captured rows -- the extension never recorded
+    // it -- so the daemon falls back to resolving the channel from the video id.
     const trackBtn = makePill('Track', 'is-track', null);
-    if (!video.channelUrl) {
-      trackBtn.disabled = true;
-      trackBtn.title = 'No channel link recorded for this video';
-    } else {
+    {
       trackBtn.disabled = false;
-      trackBtn.title = `Track ${video.channel} for new uploads`;
+      trackBtn.title = video.channel
+        ? `Track ${video.channel} for new uploads`
+        : 'Track this channel for new uploads';
       trackBtn.onclick = () => {
         if (trackBtn.disabled) return;
         const label = trackBtn.textContent;
@@ -242,7 +243,8 @@ const renderBatch = () => {
         trackBtn.classList.add('is-working');
         trackBtn.textContent = '...';
         chrome.runtime.sendMessage(
-          { type: 'yth-track-channel', channel: video.channelUrl },
+          { type: 'yth-track-channel',
+            channel: video.channelUrl, videoId: video.videoId },
           (result) => {
             void chrome.runtime.lastError;
             trackBtn.classList.remove('is-working');
@@ -256,7 +258,7 @@ const renderBatch = () => {
             trackBtn.classList.add('is-sent');
             showToast(result.added.existing
               ? `Already tracking ${result.added.title}`
-              : `Now tracking ${result.added.title || video.channel}`);
+              : `Now tracking ${result.added.title || video.channel || 'that channel'}`);
           });
       };
     }

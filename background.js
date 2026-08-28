@@ -255,7 +255,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!cfg.ythToken) return { error: 'Sync daemon not configured' };
       return ythFetch(cfg, '/tracked-add', {
         method: 'POST',
-        body: JSON.stringify({ channel: message.channel })
+        body: JSON.stringify({ channel: message.channel,
+                               videoId: message.videoId })
       }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))));
     }).then(sendResponse).catch((e) => sendResponse({ error: String(e) }));
     return true;
