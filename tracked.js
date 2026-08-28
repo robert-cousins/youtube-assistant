@@ -527,8 +527,16 @@ const openSubs = () => {
 
 // `keepSubs` is accepted so callers inside the subscriptions panel read as
 // intentional; the cache is never invalidated here, only by a page reload.
+// Pages on the cursor the payload returns. The server caps a response, and a
+// silent truncation in a notice list is worse than a second round trip.
+const loadPage = (since, acc) => ythCall(`/tracked?since=${since}`).then((data) => {
+  const items = acc.concat(data.videos || []);
+  if (data.more && data.cursor > since) return loadPage(data.cursor, items);
+  return { videos: items, channels: data.channels || [] };
+});
+
 const load = ({ quiet = false } = {}) => {
-  return ythCall('/tracked?since=0').then((data) => {
+  return loadPage(0, []).then((data) => {
     allItems = data.videos || [];
     allChannels = data.channels || [];
     statNew.textContent = allItems.filter((v) => !v.cleared).length.toLocaleString();
@@ -561,25 +569,32 @@ const load = ({ quiet = false } = {}) => {
 // Refresh polls every tracked feed server-side, which takes a second or two per
 // channel, so it never blocks the render: the list is drawn from what we have,
 // the button reports progress, and the list reloads when the poll returns.
-const doRefresh = () => {
+const doRefresh = ({ force = true } = {}) => {
   const label = 'Refresh';
   refreshBtn.disabled = true;
   refreshBtn.textContent = 'Checking…';
-  ythCall('/tracked-refresh', { method: 'POST', body: '{}' })
+  return ythCall('/tracked-refresh', {
+    method: 'POST',
+    body: JSON.stringify({ force })
+  })
     .then((result) => {
       refreshBtn.disabled = false;
       refreshBtn.textContent = label;
-      showToast(result.busy
-        ? 'A check is already running - the list will update shortly'
-        : result.new
-          ? `${result.new} new video(s) from ${result.checked} channel(s)`
-          : `Up to date (${result.checked} channel(s) checked)`);
-      return load();
+      // Opening the tab checks only stale channels and says nothing unless it
+      // actually found something; pressing Refresh always reports back.
+      if (force || result.new) {
+        showToast(result.busy
+          ? 'A check is already running - the list will update shortly'
+          : result.new
+            ? `${result.new} new video(s) from ${result.checked} channel(s)`
+            : `Up to date (${result.checked} channel(s) checked)`);
+      }
+      return result.new || force ? load({ quiet: true }) : null;
     })
     .catch((err) => {
       refreshBtn.disabled = false;
       refreshBtn.textContent = label;
-      showToast(`Refresh failed: ${err.message}`);
+      if (force) showToast(`Refresh failed: ${err.message}`);
     });
 };
 
@@ -646,7 +661,7 @@ clearedToggle.onchange = () => {
   applyFilters();
 };
 
-refreshBtn.onclick = doRefresh;
+refreshBtn.onclick = () => doRefresh({ force: true });
 
 document.getElementById('channel-toggle').onclick = () => {
   document.getElementById('channel-bar').classList.toggle('collapsed');
@@ -673,5 +688,6 @@ document.getElementById('theme-select').onchange = (e) => {
 };
 
 // A visit is itself a request for current data, so poll on open rather than
-// showing whatever the last background cycle happened to leave behind.
-load().then(doRefresh);
+// showing whatever the last background cycle happened to leave behind -- but
+// only for channels nothing has checked lately. Pressing Refresh checks all.
+load().then(() => doRefresh({ force: false }));
