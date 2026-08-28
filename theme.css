@@ -553,8 +553,9 @@ a {
 }
 
 /* Per-row tool stack, between thumbnail and title.
-   Three pills at the title's own font size, sized so the stack stays within a
-   medium thumbnail's height. */
+   Pills at the title's own font size, sized so the stack stays within a medium
+   thumbnail's height. History carries four (Clear/Track/Robert/George), Tracked
+   three. */
 .video-rows .card-tools {
   display: flex;
   flex-direction: column;
@@ -598,6 +599,23 @@ a {
   background: rgba(255, 77, 77, 0.12);
   border-color: #ff4d4d;
   color: #ff4d4d;
+}
+
+/* Track adds the channel to the Tracked tab rather than acting on this video,
+   so it gets its own hue -- a row-level action next to three video-level ones. */
+.video-rows .pill-btn.is-track:hover {
+  background: rgba(80, 160, 255, 0.12);
+  border-color: #4f9dff;
+  color: #4f9dff;
+}
+
+/* Already emailed: reads as a completed state rather than a broken control. */
+.video-rows .pill-btn.is-sent,
+.video-rows .pill-btn.is-sent[disabled] {
+  border-color: transparent;
+  background: var(--accent-surface);
+  color: var(--accent);
+  opacity: 0.85;
 }
 
 .video-rows .pill-btn[disabled] {

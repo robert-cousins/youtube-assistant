@@ -248,6 +248,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'yth-track-channel') {
+    // Track pill on a History row. The daemon resolves whatever it is handed --
+    // channel URL, @handle or UC id -- so no resolution happens here.
+    ythConfig().then((cfg) => {
+      if (!cfg.ythToken) return { error: 'Sync daemon not configured' };
+      return ythFetch(cfg, '/tracked-add', {
+        method: 'POST',
+        body: JSON.stringify({ channel: message.channel })
+      }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))));
+    }).then(sendResponse).catch((e) => sendResponse({ error: String(e) }));
+    return true;
+  }
+
   if (message.type === 'yth-pull-now') {
     // The History page asks for this on load so a refresh is always current.
     ythPull().then(sendResponse);

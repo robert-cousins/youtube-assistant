@@ -224,6 +224,44 @@ const renderBatch = () => {
 
     tools.appendChild(makePill('Clear', 'is-clear', () => removeVideo(video.videoId)));
 
+    // Track: start watching this video's channel for new uploads, which then
+    // appear on the Tracked tab without needing to be watched first. Kept here
+    // rather than in the card menu because the whole point is that it is a
+    // one-click reaction to something you just enjoyed.
+    const trackBtn = makePill('Track', 'is-track', null);
+    if (!video.channelUrl) {
+      trackBtn.disabled = true;
+      trackBtn.title = 'No channel link recorded for this video';
+    } else {
+      trackBtn.disabled = false;
+      trackBtn.title = `Track ${video.channel} for new uploads`;
+      trackBtn.onclick = () => {
+        if (trackBtn.disabled) return;
+        const label = trackBtn.textContent;
+        trackBtn.disabled = true;
+        trackBtn.classList.add('is-working');
+        trackBtn.textContent = '...';
+        chrome.runtime.sendMessage(
+          { type: 'yth-track-channel', channel: video.channelUrl },
+          (result) => {
+            void chrome.runtime.lastError;
+            trackBtn.classList.remove('is-working');
+            if (!result || result.error) {
+              trackBtn.textContent = label;
+              trackBtn.disabled = false;
+              showToast(`Could not track: ${(result && result.error) || 'no response'}`);
+              return;
+            }
+            trackBtn.textContent = 'Tracked';
+            trackBtn.classList.add('is-sent');
+            showToast(result.added.existing
+              ? `Already tracking ${result.added.title}`
+              : `Now tracking ${result.added.title || video.channel}`);
+          });
+      };
+    }
+    tools.appendChild(trackBtn);
+
     const robertBtn = makePill('Robert', 'is-robert', null);
     if (video.summaryState === 'no_transcript') {
       robertBtn.disabled = true;
@@ -262,7 +300,15 @@ const renderBatch = () => {
     }
     tools.appendChild(robertBtn);
     const georgeBtn = makePill('George', 'is-george', null);
-    if (video.summaryState === 'no_transcript') {
+    if (video.emailedAt) {
+      // One send per video. The daemon enforces this too -- the button is the
+      // reminder, not the guard.
+      georgeBtn.disabled = true;
+      georgeBtn.textContent = 'Sent';
+      georgeBtn.classList.add('is-sent');
+      georgeBtn.title = `Emailed to ${video.emailedTo || 'recipient'} on `
+        + new Date(video.emailedAt).toLocaleString();
+    } else if (video.summaryState === 'no_transcript') {
       georgeBtn.disabled = true;
       georgeBtn.title = 'No transcript available for this video';
     } else {
@@ -283,12 +329,22 @@ const renderBatch = () => {
             georgeBtn.classList.remove('is-working');
             georgeBtn.textContent = label;
             georgeBtn.disabled = false;
+            if (result && result.state === 'already_sent') {
+              georgeBtn.disabled = true;
+              georgeBtn.textContent = 'Sent';
+              georgeBtn.classList.add('is-sent');
+              showToast(`Already emailed to ${result.detail}`);
+              return;
+            }
             if (!result || result.state !== 'sent') {
               // Surfaced in full: the common failure is a Resend recipient
               // restriction, and the message says exactly how to fix it.
               showToast(`Email failed: ${(result && result.error) || 'no response'}`);
               return;
             }
+            georgeBtn.disabled = true;
+            georgeBtn.textContent = 'Sent';
+            georgeBtn.classList.add('is-sent');
             showToast(`Summary emailed to ${result.detail.split(' ')[0]}`);
             loadHistoryFromDb();
           });
