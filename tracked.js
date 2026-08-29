@@ -375,12 +375,16 @@ const renderChannels = () => {
   }
   allChannels.forEach((ch) => {
     const chip = document.createElement('span');
-    chip.className = ch.lastError ? 'channel-chip has-error' : 'channel-chip';
+    // Only a repeatedly-failing channel is marked. YouTube's feed endpoint
+    // returns the odd spurious 404/500 on a perfectly good channel, and
+    // painting the chip red for one of those is a false alarm.
+    chip.className = ch.failing ? 'channel-chip has-error' : 'channel-chip';
     const name = document.createElement('span');
     name.className = 'chip-name';
     name.textContent = ch.title;
-    name.title = ch.lastError
-      ? `Last check failed: ${ch.lastError}`
+    name.title = ch.failing
+      ? `Failed ${ch.failCount} checks in a row: ${ch.lastError}`
+        + (ch.lastOk ? ` (last worked ${formatAge(new Date(ch.lastOk).toISOString())})` : '')
       : `${ch.handle || ch.channelId} - ${formatChecked(ch.lastChecked).toLowerCase()}`;
     const count = document.createElement('span');
     count.className = 'chip-count';
@@ -403,8 +407,10 @@ const renderChannels = () => {
   });
 
   const summary = document.getElementById('channel-summary');
-  const failing = allChannels.filter((c) => c.lastError).length;
-  summary.textContent = failing ? `${failing} channel(s) failing to check` : '';
+  const failing = allChannels.filter((c) => c.failing);
+  summary.textContent = failing.length
+    ? `Not responding: ${failing.map((c) => c.title).join(', ')}`
+    : '';
 };
 
 const addChannel = (spec) => {
