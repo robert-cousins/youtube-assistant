@@ -85,9 +85,12 @@ const setQueued = (sub, queued) => ythCall('/subs-queue', {
   body: JSON.stringify({ channelIds: [sub.channelId], cancel: !queued })
 }).then((result) => {
   if (result.error) throw new Error(result.error);
-  applyPayload(result);
+  applyPayload(result, { keepPosition: true });
+  const warn = (result.warnings || []).find((w) => w.channelId === sub.channelId);
   showToast(queued
-    ? `${sub.title} queued — cancel any time before it runs`
+    ? (warn
+      ? `${sub.title} queued — note: ${warn.why}. Undo on the row, or Cancel all.`
+      : `${sub.title} queued — cancel any time before it runs`)
     : `${sub.title} taken off the queue`);
 }).catch((err) => showToast(`Failed: ${err.message}`));
 
@@ -361,16 +364,20 @@ const renderStats = () => {
     ? `Quota: ${budget.used}/${budget.budget} units today` : '';
 };
 
-const applyPayload = (data) => {
+const applyPayload = (data, { keepPosition = false } = {}) => {
   if (data.subscriptions) allSubs = data.subscriptions;
   if (data.budget) budget = data.budget;
   renderStats();
   renderQueue();
+  // A background reload must not throw you back to row 30 while you are
+  // triaging row 200. Re-render as many pages as were already open.
+  const pages = keepPosition ? Math.max(1, Math.ceil(currentIndex / PAGE_SIZE)) : 1;
   applyFilters();
+  for (let i = 1; i < pages && currentIndex < filtered.length; i += 1) renderBatch();
 };
 
-const load = () => ythCall('/subs')
-  .then(applyPayload)
+const load = ({ keepPosition = false } = {}) => ythCall('/subs')
+  .then((data) => applyPayload(data, { keepPosition }))
   .catch((err) => {
     container.replaceChildren();
     const empty = document.createElement('div');
@@ -484,4 +491,4 @@ document.getElementById('theme-select').onchange = (e) => {
 // Upload activity fills in a few channels a minute in the background, and the
 // queue drains at the same rate, so a page left open refreshes itself.
 load();
-setInterval(load, 60000);
+setInterval(() => load({ keepPosition: true }), 60000);
