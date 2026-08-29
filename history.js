@@ -4,11 +4,17 @@ const sortSelect       = document.getElementById('sort-select');
 const hideWatchedToggle = document.getElementById('hide-watched-toggle');
 const loadMoreBtn      = document.getElementById('load-more-btn');
 const statTotal        = document.getElementById('stat-total');
+const statShown        = document.getElementById('stat-shown');
+const windowSelect     = document.getElementById('window-select');
 
 let allHistory     = [];
 let filteredHistory = [];
 let currentIndex   = 0;
 let hideWatched    = false;
+// Days of history to display. The record keeps everything -- this only decides
+// what the tab renders, so widening it back to Everything is instant and loses
+// nothing. 0 means no limit.
+let windowDays     = 14;
 const PAGE_SIZE    = 24;
 
 const showToast = (message) => {
@@ -45,9 +51,11 @@ const removeVideo = (videoId) => {
 const applyFilters = () => {
   const query = searchInput.value.toLowerCase().trim();
   const sort = sortSelect.value;
+  const cutoff = windowDays ? Date.now() - windowDays * 86400000 : 0;
 
   filteredHistory = allHistory.filter(v => {
     if (v.hidden) return false;                 // soft-deleted in the shared record
+    if (cutoff && (v.timestamp || 0) < cutoff) return false;
     if (hideWatched && v.watched) return false;
     if (query) {
       return v.title.toLowerCase().includes(query) ||
@@ -64,6 +72,7 @@ const applyFilters = () => {
     filteredHistory.sort((a, b) => b.timestamp - a.timestamp);
   }
 
+  statShown.textContent = filteredHistory.length.toLocaleString();
   currentIndex = 0;
   container.replaceChildren();
   renderBatch();
@@ -81,10 +90,17 @@ const renderBatch = () => {
     icon.textContent = '\uD83D\uDCFA';
     const text = document.createElement('div');
     text.className = 'empty-text';
-    text.textContent = searchInput.value ? 'No matching videos' : 'No history saved yet';
+    const narrowed = !searchInput.value && windowDays && allHistory.length;
+    text.textContent = searchInput.value
+      ? 'No matching videos'
+      : narrowed ? 'Nothing in this window' : 'No history saved yet';
     const sub = document.createElement('div');
     sub.className = 'empty-sub';
-    sub.textContent = searchInput.value ? 'Try a different search term' : 'Watch YouTube videos to start tracking';
+    sub.textContent = searchInput.value
+      ? 'Try a different search term'
+      : narrowed
+        ? `Nothing watched in the last ${windowDays} days. Widen "Show" to see older videos.`
+        : 'Watch YouTube videos to start tracking';
     empty.appendChild(icon);
     empty.appendChild(text);
     empty.appendChild(sub);
@@ -509,6 +525,19 @@ searchInput.oninput = () => {
 };
 
 sortSelect.onchange = applyFilters;
+
+// Persisted so both profiles and every reload agree on the window.
+chrome.storage.local.get({ historyWindowDays: 14 }, ({ historyWindowDays }) => {
+  windowDays = Number(historyWindowDays) || 0;
+  windowSelect.value = String(windowDays);
+  applyFilters();
+});
+
+windowSelect.onchange = () => {
+  windowDays = Number(windowSelect.value) || 0;
+  chrome.storage.local.set({ historyWindowDays: windowDays });
+  applyFilters();
+};
 
 hideWatchedToggle.onchange = () => {
   hideWatched = hideWatchedToggle.checked;

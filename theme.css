@@ -601,6 +601,18 @@ a {
   color: #ff4d4d;
 }
 
+/* At Small the four-pill stack is taller than the thumbnail, so the row height
+   stops tracking the size control and "Small" saves no vertical space at all.
+   Shrink the pills to match rather than dropping one: every pill is reachable
+   at every size. */
+.video-rows.thumb-small .pill-btn {
+  font-size: 11px;
+  padding: 1px 8px;
+  line-height: 1.1;
+}
+
+.video-rows.thumb-small .card-tools { gap: 2px; }
+
 /* Track adds the channel to the Tracked tab rather than acting on this video,
    so it gets its own hue -- a row-level action next to three video-level ones. */
 .video-rows .pill-btn.is-track:hover {

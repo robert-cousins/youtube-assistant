@@ -75,6 +75,7 @@
 
   <!-- Stats -->
   <div class="stat-bar">
+    <span class="stat-item">Showing: <strong id="stat-shown">0</strong></span>
     <span class="stat-item">Total Archived: <strong id="stat-total">0</strong></span>
   </div>
 
@@ -85,6 +86,14 @@
       <input type="checkbox" id="hide-watched-toggle">
       <span>Hide watched</span>
     </label>
+    <label class="hide-watched-label" for="window-select">Show</label>
+    <select id="window-select" class="sort-select">
+      <option value="14">Last 2 weeks</option>
+      <option value="30">Last month</option>
+      <option value="90">Last 3 months</option>
+      <option value="365">Last year</option>
+      <option value="0">Everything</option>
+    </select>
     <label class="hide-watched-label" for="theme-select">Theme</label>
     <select id="theme-select" class="sort-select">
       <option value="auto">Match YouTube</option>
