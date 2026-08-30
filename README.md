@@ -197,6 +197,7 @@ presence of a row is not enough — see `PLAN.md` §2.
 
 | Command | What it does |
 |---|---|
+| `yth auth [--gmail\|--write] --from-env` | Authorise; each scope stored separately |
 | `yth serve` | The daemon: HTTP bridge, background syncs, unsubscribe worker |
 | `yth report [--since 5d] [--json]` | Render the record as markdown or JSON |
 | `yth sync-likes` | Pull liked videos (also runs in the daemon) |
