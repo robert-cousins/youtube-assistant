@@ -338,6 +338,12 @@ const renderQueue = () => {
   const rate = document.getElementById('queue-rate');
   if (!budget) {
     rate.textContent = '';
+  } else if (budget.blocked) {
+    // Say what is stopping it. A queue held up because the write scope was
+    // never authorised looked exactly like one waiting its turn, which is
+    // precisely the confusion this line exists to prevent.
+    rate.className = 'budget-warn';
+    rate.textContent = budget.blockedDetail;
   } else if (budget.unsubsLeft <= 0) {
     rate.className = 'budget-warn';
     rate.textContent = `Daily budget reached (${budget.used}/${budget.budget} units)`
