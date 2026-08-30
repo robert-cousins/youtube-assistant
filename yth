@@ -1,0 +1,3836 @@
+#!/usr/bin/env python3
+"""yth — progressive YouTube watch-history record.
+
+Consumes exports from the yt-watch-history browser extension and merges them
+into a durable SQLite record, then renders a windowed report.
+
+  yth import [FILE]        merge an export (defaults to newest in ~/Downloads)
+  yth report [--since 5d]  render markdown (or --json)
+  yth track add @handle    watch a channel for new uploads (Tracked tab)
+
+Every export is a full snapshot, so import is a merge, not an incremental
+fetch: skip a week and the next import backfills it.
+"""
+
+import argparse
+import base64
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from glob import glob
+from pathlib import Path
+
+# Australia/Perth is a fixed UTC+8 with no DST, so a fixed offset is exact
+# and avoids depending on tzdata being present.
+PERTH = timezone(timedelta(hours=8), "AWST")
+
+DEFAULT_DB = Path(__file__).resolve().parent / "history.db"
+# Windows Chrome running under WSL downloads to /mnt/c/Users/<name>/Downloads,
+# not ~/Downloads, so both are searched and the newest file across them wins.
+DEFAULT_EXPORT_GLOBS = [
+    str(Path.home() / "Downloads" / "yt-history-*.json"),
+    "/mnt/c/Users/*/Downloads/yt-history-*.json",
+]
+WATCH_URL = "https://www.youtube.com/watch?v={}"
+
+# Credentials live outside the project directory: this folder is a candidate for
+# `git init`, and a leaked refresh token is the worst outcome available here.
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "yth"
+CREDS_PATH = CONFIG_DIR / "credentials.json"
+# Mail may be sent from a different Google account than the one whose YouTube
+# data is read, so the two tokens cannot share a file.
+GMAIL_CREDS_PATH = CONFIG_DIR / "credentials-gmail.json"
+# Write access to the YouTube account, kept in its own file so read-only work
+# never runs with write authority. Nothing defaults to this path: the only
+# caller is the unsubscribe worker, which names it explicitly.
+WRITE_CREDS_PATH = CONFIG_DIR / "credentials-youtube-write.json"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+API_ROOT = "https://www.googleapis.com/youtube/v3"
+SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+# Write access to subscriptions. There is no subscriptions-only write scope:
+# this one also permits playlist edits, video metadata updates and channel
+# settings, which is why it lives in its own credentials file and is reachable
+# from exactly one call site (the unsubscribe worker) rather than by default.
+YOUTUBE_WRITE_SCOPE = "https://www.googleapis.com/auth/youtube"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS videos (
+    video_id      TEXT PRIMARY KEY,
+    title         TEXT,
+    channel       TEXT,
+    channel_url   TEXT,
+    duration      INTEGER,
+    last_position INTEGER,
+    watched       INTEGER,
+    watch_count   INTEGER,
+    live          INTEGER,
+    live_replay   INTEGER,
+    first_seen    INTEGER,
+    last_seen     INTEGER
+);
+-- 'seconds' is part of the key because flushActiveWatchTime can emit a 60s
+-- chunk row and a partial row within the same millisecond; a two-column key
+-- would silently discard the second one.
+CREATE TABLE IF NOT EXISTS sessions (
+    video_id    TEXT,
+    watched_at  INTEGER,
+    seconds     REAL,
+    stream_type TEXT,
+    PRIMARY KEY (video_id, watched_at, seconds)
+);
+CREATE TABLE IF NOT EXISTS imports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    imported_at  INTEGER,
+    source_file  TEXT,
+    export_date  TEXT,
+    new_videos   INTEGER,
+    new_sessions INTEGER
+);
+-- Stored so that a round-trip back into the extension is lossless. Without
+-- these the extension regenerates events from watchCount and every event
+-- collapses onto the video's timestamp.
+CREATE TABLE IF NOT EXISTS watch_events (
+    video_id   TEXT,
+    watched_at INTEGER,
+    watch_duration_seconds REAL,
+    PRIMARY KEY (video_id, watched_at)
+);
+-- Per-channel caption repairs. Auto-captions mis-hear the same proper nouns
+-- every time for a given speaker, so the fix belongs to the channel, not the
+-- video. Applied as a literal substitution before the model sees the text:
+-- a string swap cannot hallucinate, and the mapping is auditable.
+CREATE TABLE IF NOT EXISTS channel_terms (
+    channel  TEXT NOT NULL,
+    wrong    TEXT NOT NULL,
+    right    TEXT NOT NULL,
+    note     TEXT,
+    added_at INTEGER,
+    PRIMARY KEY (channel, wrong)
+);
+-- Channels whose new uploads should be surfaced without waiting for a watch.
+-- Polled from the per-channel Atom feed, which costs no API quota.
+CREATE TABLE IF NOT EXISTS tracked_channels (
+    channel_id   TEXT PRIMARY KEY,
+    handle       TEXT,
+    title        TEXT,
+    added_at     INTEGER,
+    last_checked INTEGER,
+    last_error   TEXT,
+    -- last_checked moves whether or not the fetch worked, so on its own it
+    -- cannot answer "is this channel actually broken?". last_ok and fail_count
+    -- can: one bad response is noise, several in a row is a real problem.
+    last_ok      INTEGER,
+    fail_count   INTEGER DEFAULT 0,
+    active       INTEGER DEFAULT 1
+);
+-- Kept apart from videos.hidden on purpose. Clearing a notice must not hide the
+-- video from History, because you may well watch it afterwards.
+CREATE TABLE IF NOT EXISTS tracked_items (
+    video_id      TEXT PRIMARY KEY,
+    channel_id    TEXT NOT NULL,
+    published_at  TEXT,
+    discovered_at INTEGER,
+    cleared_at    INTEGER DEFAULT 0,
+    row_updated   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tracked_items_updated ON tracked_items(row_updated);
+CREATE INDEX IF NOT EXISTS idx_tracked_items_channel ON tracked_items(channel_id);
+-- Units spent per YouTube quota day. Keyed on the PACIFIC date: the quota
+-- resets at midnight America/Los_Angeles (with DST), so keying on Perth or UTC
+-- would roll the budget over mid-afternoon and report the wrong remaining spend
+-- for most of the day.
+CREATE TABLE IF NOT EXISTS quota_usage (
+    day      TEXT PRIMARY KEY,
+    units    INTEGER DEFAULT 0,
+    calls    INTEGER DEFAULT 0,
+    updated  INTEGER
+);
+-- Every channel the account subscribes to, plus what the record knows about
+-- whether it is worth keeping. `sub_id` is the SUBSCRIPTION id, which is what
+-- subscriptions.delete takes -- not the channel id, and it changes if you
+-- unsubscribe and resubscribe, so it is re-verified before a delete is sent.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    channel_id     TEXT PRIMARY KEY,
+    sub_id         TEXT,
+    title          TEXT,
+    description    TEXT,
+    thumbnail      TEXT,
+    subscribed_at  TEXT,
+    last_upload_at TEXT,
+    upload_count   INTEGER,
+    activity_at    INTEGER,
+    activity_error TEXT,
+    synced_at      INTEGER,
+    present        INTEGER DEFAULT 1,
+    -- NULL | 'queued' | 'sent' | 'done' | 'failed' | 'cancelled'. An enum, not
+    -- a boolean: a queued row can sit for days before the worker reaches it,
+    -- and "queued" and "already gone" must never be confused.
+    unsub_state    TEXT,
+    unsub_queued_at INTEGER,
+    unsub_done_at  INTEGER,
+    unsub_error    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subs_unsub ON subscriptions(unsub_state);
+CREATE TABLE IF NOT EXISTS likes (
+    video_id    TEXT PRIMARY KEY,
+    liked_at    INTEGER,
+    approximate INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_video ON sessions(video_id);
+CREATE INDEX IF NOT EXISTS idx_videos_last_seen ON videos(last_seen);
+"""
+
+
+class ExportFormatError(Exception):
+    """The export did not match the expected shape."""
+
+
+def connect(path):
+    global _QUOTA_DB
+    _QUOTA_DB = str(path)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    # Databases created before the likes feature lack the source column.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN source TEXT DEFAULT 'extension'")
+        conn.commit()
+    if "row_updated" not in cols:
+        # Monotonic per-row stamp so each client can ask "what changed since X".
+        conn.execute("ALTER TABLE videos ADD COLUMN row_updated INTEGER DEFAULT 0")
+        conn.execute("UPDATE videos SET row_updated = COALESCE(last_seen, 0)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_row_updated"
+                     " ON videos(row_updated)")
+        conn.commit()
+    if "description" not in cols:
+        # Descriptions come only from the API — neither the extension nor the
+        # export carries them — so they are backfilled rather than captured.
+        conn.execute("ALTER TABLE videos ADD COLUMN description TEXT")
+        conn.commit()
+    if "summary" not in cols:
+        # Kept separate from `description` so the YouTube text survives and a
+        # re-summarise is never destructive.
+        conn.execute("ALTER TABLE videos ADD COLUMN summary TEXT")
+        # 'ok' | 'no_transcript' | 'error'. NULL means never attempted, which is
+        # what lets the UI distinguish "not tried" from "tried, impossible".
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_state TEXT")
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_at INTEGER")
+        conn.commit()
+    if "published_at" not in cols:
+        # The article byline asks for a publication date, which the model cannot
+        # know unless we hand it over.
+        conn.execute("ALTER TABLE videos ADD COLUMN published_at TEXT")
+        conn.commit()
+    if "transcript" not in cols:
+        # Cached at generation time: re-fetching for verification doubles the
+        # load on YouTube's unofficial endpoint and gets rate-limited, and a
+        # failed fetch used to degrade verification silently.
+        conn.execute("ALTER TABLE videos ADD COLUMN transcript TEXT")
+        conn.commit()
+    if "article" not in cols:
+        # Kept apart from `summary`: the article is written for an email reader
+        # and is far too long for the History column.
+        conn.execute("ALTER TABLE videos ADD COLUMN article TEXT")
+        conn.execute("ALTER TABLE videos ADD COLUMN article_at INTEGER")
+        conn.execute("ALTER TABLE videos ADD COLUMN article_cost REAL")
+        conn.execute("ALTER TABLE videos ADD COLUMN article_ms INTEGER")
+        conn.commit()
+    if "emailed_at" not in cols:
+        # Recorded server-side so "already sent" survives a browser reload and
+        # is the same answer in both profiles.
+        conn.execute("ALTER TABLE videos ADD COLUMN emailed_at INTEGER")
+        conn.execute("ALTER TABLE videos ADD COLUMN emailed_to TEXT")
+        conn.commit()
+    if "summary_cost" not in cols:
+        # Actual billed cost from OpenRouter, plus wall-clock for the whole
+        # click-to-result path, so the footer reports what was really spent.
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_cost REAL")
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_ms INTEGER")
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_tokens_in INTEGER")
+        conn.execute("ALTER TABLE videos ADD COLUMN summary_tokens_out INTEGER")
+        conn.commit()
+    if "hidden" not in cols:
+        # Soft delete: a hard delete would be undone by the next likes sync,
+        # since the video is still in the likes playlist.
+        conn.execute("ALTER TABLE videos ADD COLUMN hidden INTEGER DEFAULT 0")
+        conn.commit()
+    if "channel_id" not in cols:
+        # Matching subscriptions to watch history by display name is fuzzy and
+        # breaks when a channel renames. videos.list already returns
+        # snippet.channelId on the call the backfill makes anyway, so the exact
+        # key costs nothing extra.
+        conn.execute("ALTER TABLE videos ADD COLUMN channel_id TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_channel_id"
+                     " ON videos(channel_id)")
+        conn.commit()
+    tc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tracked_channels)")}
+    if tc_cols and "fail_count" not in tc_cols:
+        conn.execute("ALTER TABLE tracked_channels ADD COLUMN last_ok INTEGER")
+        conn.execute("ALTER TABLE tracked_channels ADD COLUMN fail_count INTEGER DEFAULT 0")
+        conn.commit()
+    like_cols = {r["name"] for r in conn.execute("PRAGMA table_info(likes)")}
+    if like_cols and "approximate" not in like_cols:
+        conn.execute("ALTER TABLE likes ADD COLUMN approximate INTEGER DEFAULT 0")
+        conn.commit()
+    return conn
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse_export(raw):
+    """Pull (videos, sessions, export_date) out of an extension export.
+
+    Fails loudly on an unrecognised shape. A silent default here would turn a
+    renamed key into a cheerful empty report, which is the worst outcome for a
+    record you are trusting to be complete.
+    """
+    if isinstance(raw, list):
+        # The extension's own importer accepts a bare array of videos.
+        return raw, [], [], None
+
+    if not isinstance(raw, dict):
+        raise ExportFormatError(
+            f"expected a JSON object or array at the top level, got {type(raw).__name__}"
+        )
+
+    # Videos live under 'history' in real exports; 'videos' is the internal
+    # store name and is accepted defensively.
+    for key in ("history", "videos"):
+        if isinstance(raw.get(key), list):
+            videos = raw[key]
+            break
+    else:
+        raise ExportFormatError(
+            "no video list found — expected a 'history' (or 'videos') array. "
+            f"Top-level keys present: {sorted(raw)}. "
+            "The export format may have changed; refusing to import rather "
+            "than write an empty record."
+        )
+
+    sessions = raw.get("watchSessions") or []
+    if not isinstance(sessions, list):
+        raise ExportFormatError("'watchSessions' present but not an array")
+
+    events = raw.get("watchEvents") or []
+    if not isinstance(events, list):
+        raise ExportFormatError("'watchEvents' present but not an array")
+
+    return videos, sessions, events, raw.get("exportDate")
+
+
+def video_id_of(v):
+    """Accept both the current 'videoId' and the legacy 'id' field."""
+    for key in ("videoId", "id"):
+        val = v.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def clean_channel(raw):
+    """Mirror of the extension's cleanChannelName.
+
+    YouTube's ytd-channel-name can yield the name twice as separate text nodes.
+    Only that exact shape is collapsed, so a channel really called "Duran Duran"
+    (single space) survives.
+    """
+    if not raw:
+        return ""
+    parts = [p.strip() for p in re.split(r"\n|\s{2,}", str(raw)) if p.strip()]
+    if len(parts) == 2 and parts[0] == parts[1]:
+        return parts[0]
+    return re.sub(r"\s+", " ", str(raw)).strip()
+
+
+def as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------- import
+
+def do_import(conn, path):
+    with open(path) as fh:
+        raw = json.load(fh)
+
+    videos, sessions, events, export_date = parse_export(raw)
+    cur = conn.cursor()
+    new_videos = 0
+
+    for v in videos:
+        vid = video_id_of(v)
+        if not vid:
+            continue
+        ts = as_int(v.get("timestamp"))
+        row = cur.execute("SELECT * FROM videos WHERE video_id = ?", (vid,)).fetchone()
+
+        incoming = {
+            "title": (v.get("title") or "").strip(),
+            "channel": clean_channel(v.get("channel")),
+            "channel_url": v.get("channelUrl") or "",
+            "duration": as_int(v.get("duration")),
+            "watched": 1 if v.get("watched") else 0,
+            "live": 1 if v.get("live") else 0,
+            "live_replay": 1 if v.get("liveReplay") else 0,
+        }
+        position = as_int(v.get("time"))
+        count = as_int(v.get("watchCount"))
+
+        if row is None:
+            new_videos += 1
+            first_seen, last_seen = ts, ts
+            merged = incoming
+        else:
+            first_seen = min(row["first_seen"] or ts, ts) if ts else row["first_seen"]
+            last_seen = max(row["last_seen"] or ts, ts)
+
+            # Two profiles (or an archived export imported after a newer one)
+            # arrive in arbitrary order, so the merge cannot be last-writer-wins.
+            # Monotonic facts take the max; descriptive fields follow whichever
+            # side is actually fresher. The comparison uses the raw incoming ts
+            # against the *stored* last_seen — after last_seen is max-merged the
+            # test would always pass.
+            position = max(position, row["last_position"] or 0)
+            count = max(count, row["watch_count"] or 0)
+            fresher = ts >= (row["last_seen"] or 0)
+            merged = incoming if fresher else {
+                k: row[k] for k in incoming
+            }
+
+        cur.execute(
+            """INSERT INTO videos (video_id, title, channel, channel_url, duration,
+                                   last_position, watched, watch_count, live,
+                                   live_replay, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(video_id) DO UPDATE SET
+                   title=excluded.title, channel=excluded.channel,
+                   channel_url=excluded.channel_url, duration=excluded.duration,
+                   last_position=excluded.last_position, watched=excluded.watched,
+                   watch_count=excluded.watch_count, live=excluded.live,
+                   live_replay=excluded.live_replay,
+                   first_seen=excluded.first_seen, last_seen=excluded.last_seen""",
+            (
+                vid, merged["title"], merged["channel"], merged["channel_url"],
+                merged["duration"], position, merged["watched"], count,
+                merged["live"], merged["live_replay"], first_seen, last_seen,
+            ),
+        )
+
+    before = conn.total_changes
+    for s in sessions:
+        vid = s.get("videoId")
+        watched_at = as_int(s.get("watchedAt"))
+        if not vid or not watched_at:
+            continue
+        try:
+            seconds = float(s.get("seconds") or 0)
+        except (TypeError, ValueError):
+            continue
+        if seconds <= 0:
+            continue
+        cur.execute(
+            "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?)",
+            (vid, watched_at, seconds, s.get("streamType") or "normal"),
+        )
+    new_sessions = conn.total_changes - before
+
+    before_events = conn.total_changes
+    for e in events:
+        vid = e.get("videoId")
+        watched_at = as_int(e.get("watchedAt"))
+        if not vid or not watched_at:
+            continue
+        dur = e.get("watchDurationSeconds")
+        cur.execute("INSERT OR IGNORE INTO watch_events VALUES (?,?,?)",
+                    (vid, watched_at,
+                     float(dur) if isinstance(dur, (int, float)) else None))
+    new_events = conn.total_changes - before_events
+
+    # The extension keeps only one mutable timestamp per video, so on a first
+    # import 'first_seen' is really "when last saved" and older viewing
+    # collapses onto import day. Session rows are append-only and do remember
+    # the earlier watches, so pull first_seen back to the earliest evidence.
+    cur.execute(
+        """UPDATE videos SET first_seen = (
+               SELECT MIN(s.watched_at) FROM sessions s
+               WHERE s.video_id = videos.video_id
+           )
+           WHERE EXISTS (
+               SELECT 1 FROM sessions s
+               WHERE s.video_id = videos.video_id
+                 AND s.watched_at < videos.first_seen
+           )"""
+    )
+
+    cur.execute(
+        "INSERT INTO imports (imported_at, source_file, export_date, new_videos, new_sessions)"
+        " VALUES (?,?,?,?,?)",
+        (
+            int(datetime.now(timezone.utc).timestamp() * 1000),
+            str(path),
+            export_date,
+            new_videos,
+            new_sessions,
+        ),
+    )
+    conn.commit()
+    return new_videos, new_sessions, new_events, len(videos), len(sessions), len(events)
+
+
+
+# ---------------------------------------------------------------- youtube api
+
+ISO_DURATION = re.compile(
+    r"^P(?:(?P<days>\d+)D)?"
+    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>[\d.]+)S)?)?$"
+)
+
+
+def parse_iso_duration(text):
+    """ISO 8601 duration -> seconds. 'P0D' (live/upcoming) becomes 0.
+
+    Python has no stdlib parser for these, and YouTube emits a day component
+    for long videos (P1DT2H3M4S), so the regex has to cover it.
+    """
+    if not text:
+        return 0
+    m = ISO_DURATION.match(text)
+    if not m:
+        return 0
+    d = m.groupdict()
+    return int(
+        int(d["days"] or 0) * 86400
+        + int(d["hours"] or 0) * 3600
+        + int(d["minutes"] or 0) * 60
+        + float(d["seconds"] or 0)
+    )
+
+
+def read_creds(path=None):
+    path = path or CREDS_PATH
+    if not path.exists():
+        which = {GMAIL_CREDS_PATH: "--gmail ", WRITE_CREDS_PATH: "--write "}.get(path, "")
+        sys.exit(f"Not authorised yet. Run:  yth auth {which}--from-env")
+    return json.loads(path.read_text())
+
+
+def write_creds(data, path=None):
+    path = path or CREDS_PATH
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
+    path.chmod(0o600)
+
+
+def post_form(url, fields):
+    body = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"OAuth request failed ({exc.code}): {exc.read().decode()[:400]}")
+
+
+def access_token(path=None):
+    """Exchange the stored refresh token for a short-lived access token."""
+    creds = read_creds(path)
+    data = post_form(TOKEN_URL, {
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"],
+        "grant_type": "refresh_token",
+    })
+    if "access_token" not in data:
+        sys.exit("Refresh failed — re-run `yth auth`. An OAuth client left in "
+                 "'Testing' publishing status expires refresh tokens after ~7 days.")
+    return data["access_token"]
+
+
+# Set by connect(). The quota ledger has to be writable from api_get, which is
+# called from a dozen places that have no connection to hand; a path is the
+# smallest thing that threads through.
+_QUOTA_DB = None
+
+
+def pacific_day(when=None):
+    """Today's date in the timezone YouTube resets the quota in.
+
+    Midnight America/Los_Angeles, which observes DST — so a fixed offset is
+    wrong for half the year. zoneinfo is used when the system carries tzdata,
+    with the US rule (second Sunday in March to first Sunday in November) as a
+    fallback so this never hard-fails on a minimal container.
+    """
+    when = when or datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return when.astimezone(ZoneInfo("America/Los_Angeles")).date().isoformat()
+    except Exception:
+        y = when.year
+
+        def nth_sunday(month, nth):
+            d = datetime(y, month, 1, tzinfo=timezone.utc)
+            d += timedelta(days=(6 - d.weekday()) % 7 + 7 * (nth - 1))
+            return d
+
+        dst = nth_sunday(3, 2) <= when < nth_sunday(11, 1)
+        return (when + timedelta(hours=-7 if dst else -8)).date().isoformat()
+
+
+def record_quota(units, endpoint=""):
+    """Debit the ledger. Called BEFORE the request for write operations.
+
+    Ordering is deliberate on the destructive path: a crash between issuing a
+    delete and committing its cost would lose the debit, and the next daemon
+    start would happily re-spend it.
+    """
+    if not _QUOTA_DB or not units:
+        return
+    try:
+        c = sqlite3.connect(_QUOTA_DB, timeout=30)
+        c.execute("PRAGMA busy_timeout = 30000")
+        c.execute(
+            "INSERT INTO quota_usage (day, units, calls, updated) VALUES (?, ?, 1, ?)"
+            " ON CONFLICT(day) DO UPDATE SET units = units + excluded.units,"
+            "   calls = calls + 1, updated = excluded.updated",
+            (pacific_day(), units,
+             int(datetime.now(timezone.utc).timestamp() * 1000)))
+        c.commit(); c.close()
+    except Exception:
+        # Metering must never take down a working API call.
+        pass
+
+
+def quota_spent(conn, day=None):
+    row = conn.execute("SELECT units, calls FROM quota_usage WHERE day = ?",
+                       (day or pacific_day(),)).fetchone()
+    return (row["units"] or 0, row["calls"] or 0) if row else (0, 0)
+
+
+def api_get(endpoint, params, token, cost=1):
+    url = f"{API_ROOT}/{endpoint}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    record_quota(cost, endpoint)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"YouTube API error ({exc.code}) on {endpoint}: {exc.read().decode()[:400]}")
+
+
+def api_delete(endpoint, params, token):
+    """DELETE against the Data API. Quota is debited by the caller.
+
+    Separate from api_get and used from exactly one place. The cost is not
+    metered here because the write path records it *before* issuing the request
+    -- see drain_unsub_queue -- and metering in both would double-count.
+    """
+    url = f"{API_ROOT}/{endpoint}?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, method="DELETE",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+            return True
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"{exc.code}: {exc.read().decode()[:200]}") from None
+
+
+def cmd_auth(client_secret_file, from_env=False, port=0,
+             scope=SCOPE, creds_path=None):
+    """OAuth2 loopback flow with PKCE.
+
+    Google withdrew the out-of-band copy-paste flow, so a local redirect is the
+    only option for an installed app. Verified that Windows Chrome can reach a
+    server bound inside WSL on 127.0.0.1.
+    """
+    if from_env:
+        # The _YTH pair is this tool's own dedicated client; the unsuffixed pair
+        # belongs to another app and is only a fallback.
+        client_id = (os.environ.get("GOOGLE_OAUTH_CLIENT_ID_YTH")
+                     or os.environ.get("GOOGLE_OAUTH_CLIENT_ID", ""))
+        client_secret = (os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET_YTH")
+                         or os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", ""))
+        if not client_id or not client_secret:
+            sys.exit("Set GOOGLE_OAUTH_CLIENT_ID_YTH / GOOGLE_OAUTH_CLIENT_SECRET_YTH "
+                     "(or the unsuffixed pair) in ~/.bash_secrets, "
+                     "or pass --client-secret <file.json>.")
+        print(f"Using client {client_id[:20]}… "
+              f"({'_YTH' if os.environ.get('GOOGLE_OAUTH_CLIENT_ID_YTH') else 'fallback'})")
+    else:
+        raw = json.loads(Path(client_secret_file).read_text())
+        block = raw.get("installed") or raw.get("web")
+        if not block:
+            sys.exit("That file has neither an 'installed' nor a 'web' section — "
+                     "download an OAuth client ID of type 'Desktop app'.")
+        client_id, client_secret = block["client_id"], block["client_secret"]
+
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    state = secrets.token_urlsafe(16)
+
+    holder = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            holder.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            ok = "code" in q and q.get("state", [None])[0] == state
+            self.wfile.write(
+                b"<h2>Authorised. You can close this tab.</h2>" if ok
+                else b"<h2>Authorisation failed. Check the terminal.</h2>")
+
+        def log_message(self, *a):
+            pass
+
+    # Port 0 picks a free port, which is fine for a Desktop-app client: those
+    # accept any loopback port. A Web-application client rejects anything not
+    # registered exactly, so --port lets you pin it to a URI you registered.
+    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    port = server.server_address[1]
+    redirect_uri = f"http://127.0.0.1:{port}"
+    threading.Thread(target=server.handle_request, daemon=True).start()
+
+    url = AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": client_id, "redirect_uri": redirect_uri,
+        "response_type": "code", "scope": scope,
+        # select_account forces the chooser: without it Google silently reuses
+        # the last account, which is how you end up authorising one with no
+        # YouTube channel and getting an empty sync.
+        "access_type": "offline", "prompt": "select_account consent",
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state,
+    })
+    print("Open this URL in your browser and approve access:\n")
+    print(url + "\n")
+    print(f"Waiting for the redirect on {redirect_uri} ...")
+
+    server.socket.settimeout(300)
+    for _ in range(300):
+        if "code" in holder or "error" in holder:
+            break
+        __import__("time").sleep(1)
+
+    if "code" not in holder:
+        sys.exit(f"No authorisation code received ({holder.get('error', 'timed out')}).")
+    if holder.get("state") != state:
+        sys.exit("State mismatch — aborting rather than trusting the redirect.")
+
+    tok = post_form(TOKEN_URL, {
+        "client_id": client_id, "client_secret": client_secret,
+        "code": holder["code"], "code_verifier": verifier,
+        "grant_type": "authorization_code", "redirect_uri": redirect_uri,
+    })
+    if "refresh_token" not in tok:
+        sys.exit("Google returned no refresh token. Revoke this app's access at "
+                 "https://myaccount.google.com/permissions and run `yth auth` again.")
+
+    target = creds_path or CREDS_PATH
+    write_creds({"client_id": client_id, "client_secret": client_secret,
+                 "refresh_token": tok["refresh_token"], "scope": scope}, target)
+    print(f"Authorised. Refresh token stored at {target} (mode 0600).")
+
+
+def fetch_likes(token, verbose=False):
+    """Every item in the account's 'liked videos' playlist.
+
+    playlistItems.snippet.publishedAt is when the item was ADDED to the
+    playlist — i.e. when it was liked — which is the timestamp the report needs.
+    The video's own upload date is contentDetails.videoPublishedAt, not this.
+    """
+    ch = api_get("channels", {"part": "contentDetails", "mine": "true"}, token)
+    items = ch.get("items") or []
+    if not items:
+        sys.exit("No channel found for this account.")
+    playlist = items[0]["contentDetails"]["relatedPlaylists"].get("likes")
+    if not playlist:
+        sys.exit("This account exposes no likes playlist.")
+
+    liked, page = [], None
+    while True:
+        params = {"part": "snippet", "playlistId": playlist, "maxResults": 50}
+        if page:
+            params["pageToken"] = page
+        data = api_get("playlistItems", params, token)
+        batch = data.get("items") or []
+        if verbose and not liked and batch:
+            # playlistItems.list takes no order parameter, so reverse-chronological
+            # is undocumented behaviour. Report it rather than depend on it.
+            print(f"  page 1 spans {batch[0]['snippet']['publishedAt']} "
+                  f"-> {batch[-1]['snippet']['publishedAt']}")
+        liked.extend(batch)
+        page = data.get("nextPageToken")
+        if not page:
+            break
+    return liked
+
+
+def fetch_durations(video_ids, token):
+    """{video_id: seconds}. Keyed by id, never zipped by position.
+
+    videos.list silently omits deleted, private and region-blocked videos, which
+    the likes playlist still returns as items — pairing by index would attach one
+    video's duration to another's title.
+    """
+    out = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i + 50]
+        data = api_get("videos", {"part": "contentDetails", "id": ",".join(chunk)}, token)
+        for item in data.get("items") or []:
+            out[item["id"]] = parse_iso_duration(item["contentDetails"].get("duration"))
+    return out
+
+
+def fetch_snippets(video_ids, token):
+    """{video_id: (description, title, channel, published, duration)}, 50/call.
+
+    contentDetails rides along on the same request: it costs no extra quota
+    unit and saves a second pass for videos discovered from a channel feed,
+    which carries everything except the duration.
+    """
+    out = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i:i + 50]
+        data = api_get("videos", {"part": "snippet,contentDetails",
+                                  "id": ",".join(chunk)}, token)
+        for item in data.get("items") or []:
+            sn = item.get("snippet") or {}
+            cd = item.get("contentDetails") or {}
+            out[item["id"]] = (sn.get("description") or "",
+                               (sn.get("title") or "").strip(),
+                               (sn.get("channelTitle") or "").strip(),
+                               sn.get("publishedAt") or "",
+                               parse_iso_duration(cd.get("duration")))
+    return out
+
+
+# A tracked discovery nobody has opened. Every surface that reads `videos`
+# broadly has to exclude these, and each surface keys on a different column, so
+# the predicate lives here once rather than being retyped (and mistyped) in
+# gather(), cmd_resync(), cmd_export_extension() and the backfill.
+UNWATCHED_TRACKED = (
+    "(v.source = 'tracked' AND COALESCE(v.watch_count, 0) = 0"
+    " AND COALESCE(v.last_position, 0) = 0"
+    " AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.video_id = v.video_id))"
+)
+
+
+def backfill_descriptions(conn, limit=200, quiet=False):
+    """Fill in descriptions, publication dates and durations that are missing.
+
+    Deleted and private videos never come back from videos.list, so they would
+    be retried forever. They are marked with an empty string rather than left
+    NULL, which is what distinguishes 'no description' from 'not fetched yet'.
+    """
+    # Any of the three missing is reason to fetch. published_at was introduced
+    # long after descriptions were filled, and keying only on description meant
+    # those rows were never revisited, leaving 1297/1298 without a date; the
+    # same trap then applied to duration, which channel feeds never supply.
+    #
+    # The duration clause excludes description = '', the marker this function
+    # writes for a video the API would not return. Without that, the 21
+    # deleted/private liked videos would be re-queried on every single pass.
+    pending = [r["video_id"] for r in conn.execute(
+        "SELECT video_id FROM videos"
+        " WHERE description IS NULL OR published_at IS NULL"
+        "    OR (COALESCE(duration, 0) = 0 AND COALESCE(description, '') != '')"
+        " ORDER BY last_seen DESC LIMIT ?", (limit,))]
+    if not pending:
+        # A tuple, not 0. Every caller unpacks two values, so the bare int made
+        # the daemon's likes loop raise "cannot unpack non-iterable int object"
+        # on every cycle -- but only once the backfill had nothing left to do,
+        # which is why it lay dormant until the day descriptions completed.
+        return 0, 0
+
+    token = access_token()
+    snippets = fetch_snippets(pending, token)
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    filled = timed = 0
+    for vid in pending:
+        desc, title, channel, published, seconds = snippets.get(
+            vid, ("", "", "", "", 0))
+        # Unavailable videos get "" so they are not re-queried on every pass.
+        # row_updated is conditional. Filling a duration must not push an
+        # unwatched tracked notice into History's /recent feed -- that is the
+        # same leak `row_updated = 0` closes at insert time, and an
+        # unconditional stamp here reopened it for all 39 of them.
+        conn.execute(
+            "UPDATE videos AS v SET description = COALESCE(description, ?),"
+            "  row_updated = CASE WHEN " + UNWATCHED_TRACKED
+            + " THEN row_updated ELSE ? END,"
+            "  channel = CASE WHEN COALESCE(channel,'') = '' THEN ? ELSE channel END,"
+            "  published_at = COALESCE(published_at, ?),"
+            "  duration = CASE WHEN COALESCE(duration, 0) = 0 THEN ? ELSE duration END"
+            " WHERE video_id = ?",
+            (desc, now, clean_channel(channel), published or "", seconds, vid))
+        if desc:
+            filled += 1
+        if seconds:
+            timed += 1
+    conn.commit()
+    if not quiet:
+        print(f"  descriptions: {len(pending)} checked, {filled} with text, "
+              f"{len(pending) - filled} unavailable/empty; {timed} durations")
+    return len(pending), filled
+
+
+def cmd_sync_likes(conn, verbose=False, quiet=False):
+    """quiet=True suppresses the no-change chatter: the daemon runs this every
+    few minutes and would otherwise fill its log with identical blocks."""
+    def say(msg):
+        if not quiet:
+            print(msg)
+
+    token = access_token()
+    say("Fetching liked videos...")
+    items = fetch_likes(token, verbose=verbose)
+    say(f"  {len(items)} items in the likes playlist")
+
+    # playlistItems.snippet.publishedAt is when the item was added to the
+    # playlist, so normally this is a real like time. When it is missing or
+    # unparseable the item is still worth having: stamp it with the sync time
+    # and flag it, rather than dropping it and under-reporting silently.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    rows, assumed = [], 0
+    for it in items:
+        sn = it.get("snippet") or {}
+        vid = (sn.get("resourceId") or {}).get("videoId")
+        if not vid:
+            continue
+        liked_at = iso_to_ms(sn.get("publishedAt"))
+        approximate = 0
+        if not liked_at:
+            liked_at, approximate = now_ms, 1
+            assumed += 1
+        rows.append((vid, liked_at, (sn.get("title") or "").strip(),
+                     (sn.get("videoOwnerChannelTitle") or "").strip(), approximate))
+
+    # Only ask for durations we do not already hold. This used to fetch all
+    # 1,238 liked videos on every run -- 25 quota units every 10 minutes, about
+    # 7,200 units a day against a 10,000 allocation, for values that had not
+    # changed since the first sync. It was invisible until the quota ledger
+    # existed, and it was quietly consuming most of the day's budget.
+    have = {r["video_id"] for r in conn.execute(
+        "SELECT video_id FROM videos WHERE COALESCE(duration, 0) > 0")}
+    wanted = [r[0] for r in rows if r[0] not in have]
+    durations = fetch_durations(wanted, token) if wanted else {}
+    unavailable = sum(1 for vid in wanted if vid not in durations)
+
+    cur = conn.cursor()
+    before = conn.total_changes
+    new_videos = 0
+    for vid, liked_at, title, channel, approximate in rows:
+        # A real timestamp seen on a later sync supersedes an assumed one; an
+        # assumed one never overwrites a real one.
+        prior = cur.execute(
+            "SELECT liked_at, approximate FROM likes WHERE video_id = ?", (vid,)).fetchone()
+        if prior is not None and approximate and not prior["approximate"]:
+            liked_at, approximate = prior["liked_at"], 0
+        superseded = (prior is not None and prior["approximate"] and not approximate)
+        cur.execute("INSERT OR REPLACE INTO likes VALUES (?,?,?)",
+                    (vid, liked_at, approximate))
+
+        if superseded:
+            # A real date replacing an assumed one is usually EARLIER, and
+            # last_seen is max-merged so it cannot move backwards on its own.
+            # For a video known only from the like, the like time is the whole
+            # truth, so reset both ends outright — otherwise the row would stay
+            # filed under the day we happened to sync.
+            cur.execute(
+                """UPDATE videos SET first_seen = ?, last_seen = ?
+                   WHERE video_id = ? AND source = 'youtube_api'
+                     AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.video_id = ?)""",
+                (liked_at, liked_at, vid, vid))
+        existing = cur.execute(
+            "SELECT duration, last_seen, first_seen FROM videos WHERE video_id = ?",
+            (vid,)).fetchone()
+        if existing is None:
+            # Known only from the API: no sessions will ever exist for it, so the
+            # report must not describe it as "not played".
+            new_videos += 1
+            cur.execute(
+                """INSERT INTO videos (video_id, title, channel, channel_url, duration,
+                                       last_position, watched, watch_count, live,
+                                       live_replay, first_seen, last_seen, source)
+                   VALUES (?,?,?,?,?,0,0,0,0,0,?,?,'youtube_api')""",
+                (vid, title, channel, "", durations.get(vid, 0), liked_at, liked_at))
+        else:
+            # The extension's record is richer; only fill genuine gaps and move
+            # last_seen forward so a phone-only like lands in the right window.
+            cur.execute(
+                """UPDATE videos SET
+                       duration = CASE WHEN COALESCE(duration,0) = 0 THEN ? ELSE duration END,
+                       title    = CASE WHEN COALESCE(title,'')  = '' THEN ? ELSE title END,
+                       channel  = CASE WHEN COALESCE(channel,'')= '' THEN ? ELSE channel END,
+                       last_seen  = MAX(COALESCE(last_seen,0), ?),
+                       first_seen = MIN(COALESCE(first_seen, ?), ?)
+                   WHERE video_id = ?""",
+                (durations.get(vid, 0), title, channel, liked_at, liked_at, liked_at, vid))
+    conn.commit()
+
+    say(f"  +{new_videos} videos new to the record")
+    say(f"  {conn.total_changes - before} rows touched")
+    if unavailable:
+        say(f"  {unavailable} liked videos are deleted/private — kept, duration unknown")
+    if assumed:
+        say(f"  {assumed} had no like date — stamped with the sync time and "
+            f"flagged approximate")
+    return new_videos
+
+
+def iso_to_ms(text):
+    if not text:
+        return 0
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+# ---------------------------------------------------------------- report
+
+def parse_since(text):
+    m = re.fullmatch(r"(\d+)\s*([dhw])", text.strip().lower())
+    if not m:
+        raise argparse.ArgumentTypeError("--since expects forms like 5d, 36h, 2w")
+    n, unit = int(m.group(1)), m.group(2)
+    return {"d": n, "w": n * 7, "h": n}, unit
+
+
+def window_start_ms(since):
+    """Start of the window, in epoch ms.
+
+    Day and week windows snap to the start of a Perth calendar day so that day
+    headers are never half-populated; hour windows stay rolling.
+    """
+    counts, unit = since
+    now = datetime.now(PERTH)
+    if unit == "h":
+        start = now - timedelta(hours=counts["h"])
+    else:
+        days = counts["d"] if unit == "d" else counts["w"]
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = midnight - timedelta(days=days - 1)
+    return int(start.timestamp() * 1000)
+
+
+def perth_day(ms):
+    return datetime.fromtimestamp(ms / 1000, PERTH)
+
+
+def fmt_duration(seconds):
+    seconds = int(round(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def gather(conn, start_ms):
+    """Videos whose last sighting falls in the window, plus their sessions.
+
+    Sessions are attached in full so --json can carry lifetime totals, but every
+    figure the markdown report prints is window-scoped: otherwise a video
+    re-opened today after an hour of viewing last month would render "1h · 80%"
+    under today's date while contributing nothing to the header, and the rows
+    would not sum to the summary line.
+    """
+    # Tracked-tab discoveries carry last_seen = publication time, so without the
+    # NOT EXISTS clause a channel you merely follow would fill this report with
+    # "not played" rows it never watched. The same leak was closed on the
+    # History tab via row_updated = 0; the report reads last_seen instead, so it
+    # needs its own guard. A tracked video you actually open gains a session (or
+    # a watch_count) and reappears here legitimately.
+    videos = conn.execute(
+        "SELECT v.*, l.liked_at, l.approximate AS liked_approx FROM videos v"
+        " LEFT JOIN likes l ON l.video_id = v.video_id"
+        " WHERE v.last_seen >= ? AND NOT " + UNWATCHED_TRACKED
+        + " ORDER BY v.last_seen DESC", (start_ms,)
+    ).fetchall()
+
+    rows = []
+    seen_ids = set()
+    for v in videos:
+        seen_ids.add(v["video_id"])
+        sessions = conn.execute(
+            "SELECT watched_at, seconds, stream_type FROM sessions"
+            " WHERE video_id = ? ORDER BY watched_at",
+            (v["video_id"],),
+        ).fetchall()
+        rows.append(build_row(dict(v), sessions, start_ms))
+
+    # Orphan sessions: watch time recorded for a video that has no metadata
+    # row. Real, and reachable by link, so surfaced rather than dropped.
+    orphans = conn.execute(
+        "SELECT video_id, watched_at, seconds, stream_type FROM sessions"
+        " WHERE watched_at >= ? AND video_id NOT IN (SELECT video_id FROM videos)"
+        " ORDER BY watched_at",
+        (start_ms,),
+    ).fetchall()
+    by_vid = {}
+    for s in orphans:
+        by_vid.setdefault(s["video_id"], []).append(s)
+    for vid, sess in by_vid.items():
+        stub = {
+            "video_id": vid, "title": "", "channel": "", "channel_url": "",
+            "duration": 0, "last_position": 0, "watched": 0, "watch_count": 0,
+            "live": 0, "live_replay": 0, "liked_at": None, "liked_approx": None,
+            "source": "extension",
+            "first_seen": sess[0]["watched_at"], "last_seen": sess[-1]["watched_at"],
+        }
+        row = build_row(stub, sess, start_ms)
+        row["orphan"] = True
+        rows.append(row)
+
+    rows.sort(key=lambda r: r["last_seen"], reverse=True)
+    return rows
+
+
+def build_row(v, sessions, start_ms):
+    total = sum(s["seconds"] for s in sessions)
+    in_window = sum(s["seconds"] for s in sessions if s["watched_at"] >= start_ms)
+    days = {perth_day(s["watched_at"]).date().isoformat() for s in sessions}
+    window_days = {perth_day(s["watched_at"]).date().isoformat()
+                   for s in sessions if s["watched_at"] >= start_ms}
+    duration = v["duration"] or 0
+    is_live = bool(v["live"] or v["live_replay"])
+
+    # Live streams store duration as 0, so a percentage would be meaningless.
+    def pct_of(seconds):
+        if duration <= 0 or is_live:
+            return None
+        return round(min(seconds / duration, 1.0) * 100)
+
+    liked_at = v["liked_at"] if "liked_at" in v.keys() else None
+    return {
+        "video_id": v["video_id"],
+        "liked": liked_at is not None,
+        "liked_at": liked_at,
+        "liked_at_perth": perth_day(liked_at).isoformat() if liked_at else None,
+        "liked_at_approximate": bool(
+            v["liked_approx"] if "liked_approx" in v.keys() else 0),
+        "source": (v["source"] if "source" in v.keys() else None) or "extension",
+        "title": v["title"] or "",
+        "channel": v["channel"] or "",
+        "url": WATCH_URL.format(v["video_id"]),
+        "duration_seconds": duration,
+        "watch_seconds": round(total, 1),
+        "window_watch_seconds": round(in_window, 1),
+        "percent": pct_of(total),
+        "window_percent": pct_of(in_window),
+        "watched_days": len(days),
+        "window_watched_days": len(window_days),
+        "times_finished": v["watch_count"] or 0,
+        "last_position_seconds": v["last_position"] or 0,
+        "live": is_live,
+        "orphan": False,
+        "first_seen": v["first_seen"],
+        "last_seen": v["last_seen"],
+        "last_seen_perth": perth_day(v["last_seen"]).isoformat(),
+        "sessions": [
+            {
+                "watched_at": s["watched_at"],
+                "watched_at_perth": perth_day(s["watched_at"]).isoformat(),
+                "seconds": s["seconds"],
+                "stream_type": s["stream_type"],
+            }
+            for s in sessions
+        ],
+    }
+
+
+def render_markdown(rows, since_text):
+    if not rows:
+        return f"# YouTube — last {since_text}\n\n_Nothing recorded in this window._\n"
+
+    opened = len(rows)
+    played = sum(1 for r in rows if r["window_watch_seconds"] > 0)
+    total = sum(r["window_watch_seconds"] for r in rows)
+
+    out = [f"# YouTube — last {since_text}", ""]
+    summary = [f"{opened} tracked", f"{played} played", f"{fmt_duration(total)} active viewing"]
+    liked_only = sum(1 for r in rows
+                     if r["liked"] and r["window_watch_seconds"] <= 0)
+    if liked_only:
+        summary.insert(2, f"{liked_only} liked elsewhere")
+    out.append("_" + " · ".join(summary) + "_")
+    out.append("")
+
+    current = None
+    for r in rows:
+        day = perth_day(r["last_seen"])
+        key = day.date()
+        if key != current:
+            if current is not None:
+                out.append("")
+            current = key
+            out.append(f"## {day.strftime('%a %d %b %Y')}")
+            out.append("")
+
+        title = r["title"] or f"(untitled — {r['video_id']})"
+        marks = ("★" if r["liked"] else "") + ("*" if r["window_watched_days"] > 1 else "")
+        out.append(f"- **[{title}]({r['url']})**" + (f" {marks}" if marks else ""))
+
+        bits = []
+        if r["channel"]:
+            bits.append(r["channel"])
+        watched = r["window_watch_seconds"]
+        if r["live"]:
+            bits.append(f"live · {fmt_duration(watched)} watched"
+                        if watched else "live · not played")
+        elif watched <= 0 and r["liked"]:
+            # Known only because it was liked — most likely watched on the phone.
+            # "not played" would be actively wrong here.
+            bits.append("liked (date approximate) · watch time unknown"
+                        if r["liked_at_approximate"] else "liked · watch time unknown")
+            if r["duration_seconds"]:
+                bits.append(f"{fmt_duration(r['duration_seconds'])} long")
+        elif watched <= 0:
+            bits.append("not played")
+            if r["duration_seconds"]:
+                bits.append(f"{fmt_duration(r['duration_seconds'])} long")
+        else:
+            piece = fmt_duration(watched)
+            if r["duration_seconds"]:
+                piece += f" of {fmt_duration(r['duration_seconds'])}"
+            if r["window_percent"] is not None:
+                piece += f" · {r['window_percent']}%"
+            bits.append(piece)
+        if r["orphan"]:
+            bits.append("metadata missing")
+        bits.append(day.strftime("%H:%M"))
+        out.append(f"  {' · '.join(bits)}")
+
+    legend = []
+    if any(r["liked"] for r in rows):
+        legend.append("★ liked")
+    if any(r["window_watched_days"] > 1 for r in rows):
+        legend.append("* watched on more than one day in this window")
+    if legend:
+        out += ["", "_" + " · ".join(legend) + "_"]
+    return "\n".join(out) + "\n"
+
+
+
+# ---------------------------------------------------------------- export back
+
+VIDEO_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
+
+
+def cmd_export_extension(conn, out_path, force=False):
+    """Emit the whole record in the extension's own import format.
+
+    The extension's import is NOT a merge — options.js calls db_replaceDatabase,
+    which "clears every application store in one atomic transaction". Feeding it
+    a likes-only file would therefore erase the watch history. The only safe
+    payload is a superset of what the extension already holds, which is exactly
+    what this record is *provided* the latest export has been imported first.
+    """
+    newest = None
+    try:
+        newest = newest_export(quiet=True)
+    except SystemExit:
+        pass
+
+    if not newest and not force:
+        # No export to compare against is the DANGEROUS case, not the safe one:
+        # the extension replaces its database on import, so emitting a file
+        # built from an unverified record would delete whatever the extension
+        # holds that this record has never seen.
+        sys.exit(
+            "Refusing to export: no extension export found to check against, so there "
+            "is no way to confirm this record is a superset of what the extension "
+            "holds.\n"
+            "Importing the result would REPLACE the extension's database and delete "
+            "anything missing here.\n\n"
+            "Export from the extension's options page first, then:\n"
+            "  yth import\n"
+            "  yth export-extension\n"
+            "(--force overrides, only if you are certain the extension has nothing "
+            "worth keeping.)"
+        )
+
+    if newest and not force:
+        with open(newest) as fh:
+            raw = json.load(fh)
+        try:
+            videos, _, _, _ = parse_export(raw)
+        except ExportFormatError:
+            videos = []
+        known = {r["video_id"] for r in conn.execute("SELECT video_id FROM videos")}
+        missing = {video_id_of(v) for v in videos} - known - {None}
+        if missing:
+            sys.exit(
+                f"Refusing to export: {len(missing)} video(s) in {newest} are not in "
+                "this record, so importing the result would DELETE them from the "
+                "extension.\n"
+                f"Run:  yth import {newest}\n"
+                "then re-run this command (or pass --force if you are certain)."
+            )
+
+    # Unwatched tracked notices are excluded. db_bulkImport clears the stores
+    # before writing, so exporting them would replace the extension's History
+    # with a list containing videos that were never watched.
+    rows = conn.execute(
+        "SELECT v.*, l.video_id IS NOT NULL AS liked FROM videos v"
+        " LEFT JOIN likes l ON l.video_id = v.video_id"
+        " WHERE NOT " + UNWATCHED_TRACKED
+    ).fetchall()
+
+    history, skipped = [], 0
+    for v in rows:
+        vid = v["video_id"]
+        if not VIDEO_ID_RE.match(vid or ""):
+            # The extension validates ids with this exact pattern and silently
+            # drops anything else; better to report it here.
+            skipped += 1
+            continue
+        history.append({
+            "videoId": vid,
+            "title": (v["title"] or "")[:300],
+            "channel": v["channel"] or "",
+            "channelUrl": v["channel_url"] or "",
+            # The extension rejects time outside 0..86400.
+            "time": max(0, min(86400, int(v["last_position"] or 0))),
+            "duration": max(0, int(v["duration"] or 0)),
+            "watched": bool(v["watched"]),
+            "watchCount": max(0, int(v["watch_count"] or 0)),
+            **({"live": True} if v["live"] else {}),
+            **({"liveReplay": True} if v["live_replay"] else {}),
+            "timestamp": max(0, int(v["last_seen"] or 0)),
+        })
+
+    valid_ids = {h["videoId"] for h in history}
+    sessions = [
+        {"videoId": r["video_id"], "watchedAt": int(r["watched_at"]),
+         # The extension rejects sessions above 3600 seconds.
+         "seconds": max(1, min(3600, int(round(r["seconds"])))),
+         "streamType": r["stream_type"] or "normal"}
+        for r in conn.execute("SELECT * FROM sessions")
+        if r["video_id"] in valid_ids and r["seconds"] and r["seconds"] > 0
+    ]
+    events = [
+        {"videoId": r["video_id"], "watchedAt": int(r["watched_at"]),
+         **({"watchDurationSeconds": r["watch_duration_seconds"]}
+            if r["watch_duration_seconds"] is not None else {})}
+        for r in conn.execute("SELECT * FROM watch_events")
+        if r["video_id"] in valid_ids
+    ]
+
+    payload = {
+        "exportDate": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "dbVersion": 3,
+        "count": len(history),
+        "history": history,
+        "watchEvents": events,
+        "watchSessions": sessions,
+    }
+    Path(out_path).write_text(json.dumps(payload, indent=2))
+
+    liked = sum(1 for r in rows if r["liked"])
+    print(f"Wrote {out_path}")
+    print(f"  {len(history)} videos ({liked} liked), {len(sessions)} sessions, "
+          f"{len(events)} watch events")
+    if skipped:
+        print(f"  {skipped} skipped — id not in YouTube's 11-character format")
+    print("\nImport it via the extension's options page. Note the extension REPLACES")
+    print("its database on import; this file is a superset, so nothing is lost.")
+
+
+
+# ---------------------------------------------------------------- summarising
+
+TRANSCRIPT_SCRIPT = Path.home() / ".hermes/skills/media/youtube-content/scripts/fetch_transcript.py"
+TRANSCRIPT_PYTHON = Path.home() / ".local/share/yth-venv/bin/python"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+SUMMARY_MODEL = "google/gemini-2.5-flash-lite"
+
+SUMMARY_PROMPT = (
+    "Provide an executive summary of the transcript. Intro, speaker's main points "
+    "with dot points briefly summarized. Target is less than 150 words."
+)
+
+ARTICLE_PROMPT = (
+    "Format this transcript so that it reads more like an essay or journalistic "
+    "article. Create a headline, not just the title of the video but more nuanced "
+    "and descriptive - not clickbait, we're already here, but truly representing "
+    "the content the reader is about to consume. At the beginning include a byline "
+    "for the channel creator and the published date. Throughout the article add "
+    "appropriate H2 headings, paragraph breaks and punctuation. Remove verbal ticks "
+    'like "you know" or "like" so that it reads as professional prose.'
+    "\n\n"
+    "ACCURACY RULES - these override style, length and readability:\n"
+    "1. Use ONLY information stated in the transcript. Do not add names, job "
+    "titles, organisations, statistics, dates, places or events that the "
+    "transcript does not contain.\n"
+    "2. REPAIR, do not INVENT. These are auto-generated captions and they "
+    "mis-hear proper nouns constantly, especially with accented speakers. You "
+    "may correct a garbled token when ALL of these hold: (a) a token is actually "
+    "present at that point in the transcript, (b) your correction is "
+    "phonetically close to it, and (c) the surrounding context makes the "
+    "identity unambiguous. A transcript reading 'Besson' throughout a US "
+    "Treasury story is the Treasury Secretary's surname mis-heard; 'SIPs' in a "
+    "Chinese payments story is CIPS. Correct those silently.\n"
+    "3. USE the names the transcript does give you - attributing a claim to the "
+    "person who made it is part of accurate reporting, and defaulting to a bare "
+    "role when a name is available makes the article vaguer than its source. The "
+    "prohibition below is ONLY about names that are absent.\n"
+    "4. You may NOT introduce an entity that has no token in the transcript at "
+    "all. If the speaker never names a person, write the role "
+    '("the Treasury Secretary", "the administration") and stop there. Supplying '
+    "a name that is simply absent is the worst failure mode here: your training "
+    "data may be out of date, and a confident wrong name destroys the reader's "
+    "trust. Repairing what is present is allowed; filling a void is not.\n"
+    "5. If a repair is uncertain - the token is garbled but context does not "
+    "settle who or what it is - keep the transcript's own wording rather than "
+    "guessing.\n"
+    "6. Use the metadata block for the byline and date and nothing else. If the "
+    "published date is given as unknown, omit the date from the byline "
+    "completely. NEVER emit a placeholder such as "
+    "'[Date of publication, e.g., October 26, 2023]'.\n"
+    "7. Do not pad or elaborate. A short transcript makes a short article. Adding "
+    "background the speaker did not provide is a factual error, not enrichment.\n"
+    "8. Quote only wording that actually appears in the transcript.\n"
+    "9. Where the transcript is vague, stay vague. Reproduce its uncertainty "
+    "rather than resolving it.\n"
+    "\n"
+    "Rewriting is limited to structure, grammar and flow. Every claim must be "
+    "traceable to the transcript."
+)
+
+# gemini-2.5-flash-lite holds ~1M tokens, so even a multi-hour transcript fits in
+# one call. This cap exists only to bound cost and latency on pathological input.
+MAX_TRANSCRIPT_CHARS = 600_000
+
+
+class CannotVerify(Exception):
+    """Verification could not run -- distinct from having found nothing wrong."""
+
+
+class NoTranscript(Exception):
+    """The video has no usable transcript — a permanent condition, not a failure."""
+
+
+def load_glossary(conn, channel):
+    if not channel:
+        return []
+    return [(r["wrong"], r["right"]) for r in conn.execute(
+        "SELECT wrong, right FROM channel_terms WHERE channel = ?"
+        " ORDER BY LENGTH(wrong) DESC", (channel,))]
+
+
+def apply_glossary(text, terms):
+    """Literal, whole-word, case-insensitive repair of known caption errors.
+
+    Returns (repaired_text, {term: count}). Longest terms are applied first so a
+    multi-word entry is not broken up by a single-word one.
+    """
+    applied = {}
+    for wrong, right in terms:
+        pattern = re.compile(r"\b" + re.escape(wrong) + r"\b", re.IGNORECASE)
+        text, n = pattern.subn(right, text)
+        if n:
+            applied[f"{wrong}->{right}"] = n
+    return text, applied
+
+
+def fetch_transcript(video_id):
+    if not TRANSCRIPT_SCRIPT.exists():
+        raise RuntimeError(f"transcript script missing at {TRANSCRIPT_SCRIPT}")
+    if not TRANSCRIPT_PYTHON.exists():
+        raise RuntimeError(
+            f"transcript venv missing at {TRANSCRIPT_PYTHON} — create it with:\n"
+            f"  uv venv ~/.local/share/yth-venv && "
+            f"uv pip install --python {TRANSCRIPT_PYTHON} youtube-transcript-api")
+
+    proc = subprocess.run(
+        [str(TRANSCRIPT_PYTHON), str(TRANSCRIPT_SCRIPT), video_id, "--text-only", "--clean"],
+        capture_output=True, text=True, timeout=120)
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+
+    # The helper signals failure with exit 1 AND a JSON {"error": ...} on
+    # stdout. Checking neither is dangerous: the error text looks like ordinary
+    # prose, so it sails into the model, which obligingly summarises the error
+    # message and stores it as though it were the video.
+    if proc.returncode != 0 or not out:
+        message = out or err or "no transcript returned"
+        try:
+            parsed = json.loads(out)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                message = str(parsed["error"])
+        except (ValueError, TypeError):
+            pass
+        message = " ".join(message.split())
+        # A network blip should stay retryable; an unavailable or
+        # transcript-less video should not be retried on every click.
+        transient = any(w in message.lower() for w in
+                        ("timed out", "timeout", "connection", "temporarily",
+                         "too many requests", "network", "resolve"))
+        if transient:
+            raise RuntimeError(message)
+        raise NoTranscript(message)
+
+    # Belt and braces: a zero exit with a JSON error body would otherwise pass.
+    if out.startswith("{") and '"error"' in out[:120]:
+        try:
+            parsed = json.loads(out)
+            raise NoTranscript(" ".join(str(parsed.get("error", out)).split()))
+        except ValueError:
+            pass
+    return out[:MAX_TRANSCRIPT_CHARS]
+
+
+def summarise_text(transcript, prompt=SUMMARY_PROMPT, max_tokens=700, model=None):
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in the daemon's environment")
+
+    body = json.dumps({
+        "model": model or SUMMARY_MODEL,
+        "messages": [{"role": "user",
+                      "content": f"{prompt}\n\n---TRANSCRIPT---\n{transcript}"}],
+        "max_tokens": max_tokens,
+        # Ask OpenRouter for the real billed cost rather than deriving it from a
+        # price table that can drift.
+        "usage": {"include": True},
+    }).encode()
+    req = urllib.request.Request(
+        OPENROUTER_URL, data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        data = json.loads(r.read())
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"no completion returned: {json.dumps(data)[:200]}")
+    return choices[0]["message"]["content"].strip(), data.get("usage") or {}
+
+
+def format_cost(cost):
+    """Costs here run to fractions of a cent, so two decimals would read $0.00."""
+    if not cost:
+        return "$0"
+    if cost >= 0.01:
+        return f"${cost:.2f}"
+    return f"${cost:.5f}".rstrip("0").rstrip(".")
+
+
+def summary_footer(cost, ms):
+    if ms is None:
+        return ""
+    return f"Summary cost {format_cost(cost)}, took {ms / 1000:.1f} sec"
+
+
+def summarise_video(conn, video_id, prompt=SUMMARY_PROMPT):
+    """Fetch, summarise and store. Returns (state, text)."""
+    started = time.monotonic()
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    try:
+        transcript = fetch_transcript(video_id)
+    except NoTranscript as exc:
+        conn.execute(
+            "UPDATE videos SET summary = NULL, summary_state = 'no_transcript',"
+            " summary_at = ?, row_updated = ? WHERE video_id = ?",
+            (now, now, video_id))
+        conn.commit()
+        return "no_transcript", str(exc)
+    except Exception as exc:
+        conn.execute(
+            "UPDATE videos SET summary_state = 'error', summary_at = ?,"
+            " row_updated = ? WHERE video_id = ?", (now, now, video_id))
+        conn.commit()
+        return "error", str(exc)
+
+    row = conn.execute("SELECT channel FROM videos WHERE video_id = ?",
+                       (video_id,)).fetchone()
+    transcript, _ = apply_glossary(transcript, load_glossary(conn, row["channel"] if row else ""))
+
+    try:
+        text, usage = summarise_text(transcript, prompt)
+    except Exception as exc:
+        conn.execute(
+            "UPDATE videos SET summary_state = 'error', summary_at = ?,"
+            " row_updated = ? WHERE video_id = ?", (now, now, video_id))
+        conn.commit()
+        return "error", str(exc)
+
+    # Wall clock for the whole path -- transcript fetch included -- because that
+    # is what the click actually costs in waiting.
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    conn.execute(
+        "UPDATE videos SET summary = ?, summary_state = 'ok', summary_at = ?,"
+        " summary_cost = ?, summary_ms = ?, summary_tokens_in = ?,"
+        " summary_tokens_out = ?, row_updated = ? WHERE video_id = ?",
+        (text, now, usage.get("cost"), elapsed_ms, usage.get("prompt_tokens"),
+         usage.get("completion_tokens"), now, video_id))
+    conn.commit()
+    return "ok", text
+
+
+def generate_article(conn, video_id):
+    """Long-form article for the email. Separate prompt, separate column.
+
+    The model is given the title, channel and publication date explicitly: the
+    prompt asks for a byline with the creator and date, and none of that appears
+    in a transcript.
+    """
+    row = conn.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+    if row is None:
+        return "error", f"{video_id} is not in the record"
+
+    started = time.monotonic()
+    try:
+        transcript = fetch_transcript(video_id)
+    except NoTranscript as exc:
+        now = int(datetime.now(timezone.utc).timestamp() * 1000)
+        conn.execute("UPDATE videos SET summary_state = 'no_transcript', summary_at = ?,"
+                     " row_updated = ? WHERE video_id = ?", (now, now, video_id))
+        conn.commit()
+        return "no_transcript", str(exc)
+    except Exception as exc:
+        return "error", str(exc)
+
+    terms = load_glossary(conn, row["channel"])
+    transcript, repaired = apply_glossary(transcript, terms)
+    if repaired:
+        print(f"  glossary [{row['channel']}]: "
+              + ", ".join(f"{k} x{v}" for k, v in repaired.items()))
+
+    conn.execute("UPDATE videos SET transcript = ? WHERE video_id = ?",
+                 (transcript, video_id))
+    conn.commit()
+
+    published = (row["published_at"] or "")[:10]
+    context = (
+        "METADATA (use for the byline; do not infer anything else from it):\n"
+        f"Video title: {row['title']}\n"
+        f"Channel / creator: {row['channel'] or 'unknown'}\n"
+        + (f"Published date: {published}\n" if published
+           else "Published date: UNKNOWN - omit the date from the byline entirely.\n")
+        + (f"Video description (creator's own words):\n{(row['description'] or '')[:1500]}\n"
+           if row["description"] else "")
+        + "\nHOW TO USE THIS METADATA: the title and description are written by the "
+          "creator, so their spellings of names and organisations are authoritative "
+          "where the auto-generated transcript's are not. If the transcript garbles a "
+          "proper noun that appears correctly spelled here, use this spelling. Do NOT "
+          "import claims, figures or people that appear only here and never in the "
+          "transcript - the title is often promotional. Metadata settles SPELLING, the "
+          "transcript settles SUBSTANCE.\n")
+    try:
+        text, usage = summarise_text(
+            f"{context}\n{transcript}", prompt=ARTICLE_PROMPT, max_tokens=4000,
+            model=load_config().get("article_model", SUMMARY_MODEL))
+    except Exception as exc:
+        return "error", str(exc)
+
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn.execute(
+        "UPDATE videos SET article = ?, article_at = ?, article_cost = ?,"
+        " article_ms = ?, row_updated = ? WHERE video_id = ?",
+        (text, now, usage.get("cost"), int((time.monotonic() - started) * 1000),
+         now, video_id))
+    conn.commit()
+    return "ok", text
+
+
+# Words that start sentences or headings constantly; flagging them as entities
+# would bury the real findings in noise.
+VERIFY_STOPWORDS = {
+    "the","this","that","these","those","and","but","for","from","with","while",
+    "when","where","what","which","who","however","although","despite","beyond",
+    "because","since","after","before","during","through","throughout","across",
+    "under","over","into","onto","between","among","against","without","within",
+    "further","furthermore","moreover","meanwhile","instead","rather","perhaps",
+    "such","some","many","most","much","more","less","other","another","each",
+    "every","both","either","neither","one","two","three","first","second","third",
+    "his","her","its","their","our","your","they","them","there","here","then",
+    "now","today","yesterday","tomorrow","published","summary","article","note",
+    "conclusion","introduction","background","context","analysis","implications",
+    "key","main","overall","finally","ultimately","indeed","yet","still","also",
+    "unthinkable","operation","strategic","global","economic","financial","reports",
+    "according","dangerous","mounting","targeting","cutting","excluding","rise",
+    "specter","dire","factor","pressures","warfare","disruption","lifelines","dump",
+}
+
+
+def verify_article(conn, video_id, article=None, transcript=None):
+    """Flag entities in the article that nothing in the source vouches for.
+
+    The haystack is the repaired transcript plus the creator's own title and
+    description. Anything named in the article but absent from all of them was
+    supplied by the model, which is precisely the failure this exists to catch.
+    """
+    row = conn.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+    if row is None:
+        return ["video not in record"]
+    article = article if article is not None else (row["article"] or "")
+    if not article:
+        return []
+
+    if transcript is None:
+        transcript = row["transcript"] or ""
+    if not transcript:
+        try:
+            transcript, _ = apply_glossary(fetch_transcript(video_id),
+                                           load_glossary(conn, row["channel"]))
+        except Exception as exc:
+            # Cannot verify is NOT the same as nothing to report. Falling back to
+            # an empty source made every entity look invented, which is a false
+            # accusation dressed as diligence.
+            raise CannotVerify(str(exc)[:160])
+
+    haystack = " ".join(filter(None, [
+        transcript, row["title"] or "", row["description"] or "",
+        row["channel"] or "",
+        " ".join(r["right"] for r in conn.execute(
+            "SELECT right FROM channel_terms WHERE channel = ?", (row["channel"],))),
+    ])).lower()
+
+    # Headings and line breaks are sentence boundaries. Without this, a candidate
+    # runs across a newline ("Dangerous Escalation\n\nThe") and every heading
+    # becomes a false positive.
+    # Headings and the byline are the model's own framing, not factual claims --
+    # their wording will never appear verbatim in a transcript, so including them
+    # buries the real findings under invented-sounding section titles.
+    lines = []
+    for line in article.split("\n"):
+        # Emphasis markers must go FIRST: leaving them in place breaks both the
+        # byline test and the sentence-boundary detection, because "**Word" is
+        # not adjacent to the preceding full stop.
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Order matters. Drop the list marker, then the bold lead-in label
+        # ("**Lead Capture:**"), which is structural like a heading, and only
+        # then remove remaining emphasis.
+        stripped = re.sub(r"^[-*\u2022]\s+|^\d+[.)]\s+", "", stripped)
+        stripped = re.sub(r"^\*\*[^*]{1,60}\*\*:?\s*", "", stripped)
+        stripped = re.sub(r"\*+", "", stripped).strip()
+        if not stripped:
+            continue
+        if re.match(r"^(by|published)\b", stripped, re.I):
+            continue
+        if re.match(r"^[A-Z][a-z]+\s+\d{1,2},?\s+\d{4}$", stripped):
+            continue                       # a bare byline date
+        lines.append(stripped)
+    body = " . ".join(lines)
+    candidates = set()
+    # Acronyms: the highest-signal case, and cheap to check.
+    candidates.update(re.findall(r"\b[A-Z]{2,6}\b", body))
+    # Capitalised runs of 2-3 words: people, organisations, places.
+    candidates.update(m.group(0).strip() for m in
+                      re.finditer(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,2}\b", body))
+    # Lone capitalised words that do not open a sentence.
+    for m in re.finditer(r"([.!?:;]\s+)?\b([A-Z][a-z]{3,})\b", body):
+        if not m.group(1):
+            candidates.add(m.group(2))
+
+    unverified = []
+    for cand in sorted(candidates):
+        words = [w for w in re.split(r"\s+", cand) if w]
+        if all(w.lower() in VERIFY_STOPWORDS for w in words):
+            continue
+        # A multi-word entity counts as grounded if every word of it appears.
+        if all(w.lower() in haystack for w in words):
+            continue
+        unverified.append(cand)
+    return unverified
+
+
+def cmd_verify(conn, video_id):
+    try:
+        flagged = verify_article(conn, video_id)
+    except CannotVerify as exc:
+        print(f"CANNOT VERIFY - {exc}")
+        return
+    if not flagged:
+        print("OK - every entity in the article is grounded in the source.")
+    else:
+        print(f"{len(flagged)} unverified entit(ies) - not found in transcript, "
+              f"title or description:")
+        for f in flagged:
+            print(f"  {f}")
+
+
+def cmd_article(conn, video_id):
+    state, text = generate_article(conn, video_id)
+    print(text if state == "ok" else f"[{state}] {text}")
+
+
+def cmd_summarise(conn, video_id):
+    state, text = summarise_video(conn, video_id)
+    if state == "ok":
+        print(text)
+        row = conn.execute(
+            "SELECT summary_cost, summary_ms, summary_tokens_in, summary_tokens_out"
+            " FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+        print(f"\n{summary_footer(row['summary_cost'], row['summary_ms'])}"
+              f"  ({row['summary_tokens_in']} in / {row['summary_tokens_out']} out)")
+    else:
+        print(f"[{state}] {text}")
+
+
+# ---------------------------------------------------------------- email
+
+CONFIG_PATH = CONFIG_DIR / "config.json"
+DEFAULT_CONFIG = {
+    # Set this in ~/.config/yth/config.json before using the George button.
+    # Deliberately empty: a hardcoded address would mail a stranger's summaries
+    # to whoever happened to be baked into the source.
+    "email_to": "",
+    # Optional. Gmail fills From from the authorised account when this is blank;
+    # set it (to that same address) only if you want a display name.
+    "email_from_address": "",
+    "email_from_name": "YouTube History",
+    # Article fidelity is worth paying for: flash-lite is the cheapest tier and
+    # the most prone to substituting familiar facts for transcript ones.
+    "article_model": "google/gemini-2.5-flash-lite",
+    "email_subject_prefix": "\U0001F4FA ",
+}
+
+
+def load_config():
+    """Config file first, environment second, defaults last.
+
+    Written out on first read so there is an obvious file to edit rather than a
+    value buried in the source.
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except ValueError:
+            print(f"warning: {CONFIG_PATH} is not valid JSON; using defaults")
+    else:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    # Environment wins, so a one-off run can override without editing the file.
+    for key, env in (("email_to", "YTH_EMAIL_TO"),
+                     ("email_from_name", "YTH_EMAIL_FROM_NAME")):
+        if os.environ.get(env):
+            cfg[key] = os.environ[env]
+    return cfg
+
+
+
+def markdown_to_html(text):
+    """Small markdown renderer for the article email.
+
+    Deliberately minimal and escape-first: headings, bold, italic, lists and
+    paragraphs are all the article prompt asks for, and pulling in a dependency
+    to render six constructs would not be a good trade.
+    """
+    blocks, buffer, out = [], [], []
+    for line in (text or "").split("\n"):
+        if line.strip():
+            buffer.append(line)
+        elif buffer:
+            blocks.append(buffer); buffer = []
+    if buffer:
+        blocks.append(buffer)
+
+    def inline(chunk):
+        chunk = html_escape(chunk)
+        chunk = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", chunk)
+        chunk = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", chunk)
+        return chunk
+
+    for block in blocks:
+        first = block[0].lstrip()
+        if first.startswith("### "):
+            out.append(f"<h3 style='margin:22px 0 8px;font-size:16px'>"
+                       f"{inline(first[4:])}</h3>")
+        elif first.startswith("## "):
+            out.append(f"<h2 style='margin:26px 0 10px;font-size:19px;"
+                       f"line-height:1.3'>{inline(first[3:])}</h2>")
+        elif first.startswith("# "):
+            out.append(f"<h1 style='margin:0 0 6px;font-size:25px;line-height:1.25'>"
+                       f"{inline(first[2:])}</h1>")
+        elif all(l.lstrip().startswith(("- ", "* ")) for l in block):
+            items = "".join(f"<li style='margin:0 0 6px'>{inline(l.lstrip()[2:])}</li>"
+                            for l in block)
+            out.append(f"<ul style='margin:0 0 16px;padding-left:22px'>{items}</ul>")
+        else:
+            joined = " ".join(l.strip() for l in block)
+            # An italic-only line straight after the headline is the byline.
+            if len(out) == 1 and joined.startswith("*") and joined.endswith("*"):
+                out.append(f"<p style='margin:0 0 20px;color:#666;font-size:14px'>"
+                           f"{inline(joined.strip('*'))}</p>")
+            else:
+                out.append(f"<p style='margin:0 0 16px'>{inline(joined)}</p>")
+    return "".join(out)
+
+
+def article_headline(text, fallback):
+    """Subject line: the model's headline if it produced one."""
+    for line in (text or "").split("\n"):
+        stripped = line.strip()
+        # Models pick their own heading level for the headline -- this one
+        # returns "## ...", so accept any level rather than only H1.
+        heading = re.match(r"^#{1,3}\s+(.*)$", stripped)
+        if heading:
+            return heading.group(1).strip()[:160]
+        if stripped and not stripped.startswith(("#", "*", "-", "_", ">")):
+            return stripped[:160]
+    return fallback
+
+
+def summary_email_html(video, summary, footer):
+    vid = video["video_id"]
+    url = WATCH_URL.format(vid)
+    channel = html_escape(video["channel"] or "")
+    title = html_escape(video["title"] or vid)
+    body = "".join(
+        f"<p style='margin:0 0 10px'>{html_escape(line)}</p>"
+        for line in summary.split("\n") if line.strip())
+    return f"""<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+     max-width:640px;color:#1a1a1a;line-height:1.5">
+  <a href="{url}"><img src="https://i.ytimg.com/vi/{vid}/mqdefault.jpg" alt=""
+     style="width:100%;max-width:640px;border-radius:8px"></a>
+  <h2 style="margin:16px 0 4px;font-size:19px">
+    <a href="{url}" style="color:#1a1a1a;text-decoration:none">{title}</a></h2>
+  <div style="color:#666;font-size:14px;margin-bottom:16px">{channel}</div>
+  <div style="border-left:3px solid #1565C0;padding-left:14px;font-size:15px">{body}</div>
+  <p style="margin-top:20px;font-size:13px">
+    <a href="{url}" style="color:#1565C0">Watch on YouTube</a></p>
+  <hr style="border:none;border-top:1px solid #e5e5e5;margin:20px 0">
+  <div style="color:#999;font-size:12px">{html_escape(footer)}</div>
+</div>"""
+
+
+def html_escape(text):
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def article_email_html(video, article, footer):
+    url = WATCH_URL.format(video["video_id"])
+    # No thumbnail: the article stands on its own, and a 320px YouTube still at
+    # the top of a serif article reads like a newsletter ad.
+    return f"""<div style="font-family:Georgia,'Times New Roman',serif;max-width:660px;
+     margin:0 auto;color:#1a1a1a;line-height:1.65;font-size:17px">
+  {markdown_to_html(article)}
+  <hr style="border:none;border-top:1px solid #e0e0e0;margin:28px 0 14px">
+  <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;font-size:13px;color:#888">
+    <a href="{url}" style="color:#1565C0;text-decoration:none">Watch the original on YouTube</a>
+    &nbsp;&middot;&nbsp; {html_escape(footer)}
+  </div>
+</div>"""
+
+
+def send_summary_email(video, summary, footer, to=None):
+    """Send through Gmail as the authorised account.
+
+    Gmail imposes no recipient restriction the way a transactional provider on
+    an unverified domain does -- the account simply sends its own mail.
+    """
+    cfg = load_config()
+    recipient = to or cfg["email_to"]
+    if not recipient:
+        raise RuntimeError('No recipient. Set "email_to" in'
+                           ' ~/.config/yth/config.json, or pass --to.')
+    token = access_token(GMAIL_CREDS_PATH)
+
+    message = EmailMessage()
+    message["To"] = recipient
+    headline = article_headline(summary, video["title"] or video["video_id"])
+    message["Subject"] = f"{cfg['email_subject_prefix']}{headline}"
+    # From is normally left for Gmail to fill from the credential. Reading the
+    # account's own address would need a read scope, and this tool holds
+    # gmail.send only -- it can send mail and cannot read any. Set
+    # email_from_address in the config to control the display name.
+    sender = cfg.get("email_from_address")
+    name = cfg.get("email_from_name")
+    if sender:
+        message["From"] = f"{name} <{sender}>" if name else sender
+    message.set_content(
+        f"{video['title']}\n{video['channel']}\n"
+        f"{WATCH_URL.format(video['video_id'])}\n\n{summary}\n\n{footer}")
+    message.add_alternative(article_email_html(video, summary, footer), subtype="html")
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    req = urllib.request.Request(
+        f"{GMAIL_API}/messages/send", data=json.dumps({"raw": raw}).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return recipient, json.loads(r.read()).get("id")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()[:400]
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except (ValueError, KeyError):
+            pass
+        raise RuntimeError(f"Gmail rejected the message: {detail}")
+
+
+def send_plain_email(subject, body, to=None):
+    """A short notice, not a summary. Same Gmail path, no HTML alternative."""
+    cfg = load_config()
+    recipient = to or cfg["email_to"]
+    if not recipient:
+        raise RuntimeError('Set "email_to" in ~/.config/yth/config.json')
+    token = access_token(GMAIL_CREDS_PATH)
+    message = EmailMessage()
+    message["To"] = recipient
+    message["Subject"] = subject
+    sender = cfg.get("email_from_address")
+    name = cfg.get("email_from_name")
+    if sender:
+        message["From"] = f"{name} <{sender}>" if name else sender
+    message.set_content(body)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    req = urllib.request.Request(
+        f"{GMAIL_API}/messages/send", data=json.dumps({"raw": raw}).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return recipient, json.loads(r.read()).get("id")
+
+
+def notify_budget_reached(budget, pending):
+    """Tell the user the unsubscribe queue has stalled on quota.
+
+    Best-effort: a failed notification must never stop the worker, and the same
+    numbers are on /subs for the UI banner regardless of whether mail got out.
+    """
+    try:
+        send_plain_email(
+            "\u26a0\ufe0f yth: daily YouTube quota budget reached",
+            f"The unsubscribe queue has paused.\n\n"
+            f"  Quota day    {budget['day']} (resets midnight US Pacific)\n"
+            f"  Spent        {budget['used']} of {budget['budget']} budgeted units\n"
+            f"  Still queued {pending} channel(s)\n\n"
+            f"Nothing is lost -- the queue resumes automatically after the reset. "
+            f"You can cancel any of it from the Subscriptions tab in the meantime.\n")
+    except Exception as exc:
+        print(f"[subs] budget notification failed: {exc}")
+
+
+def email_video_summary(conn, video_id, to=None, force=False):
+    """Ensure a summary exists, then email it. Returns (state, detail)."""
+    row = conn.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+    if row is None:
+        return "error", f"{video_id} is not in the record"
+
+    # One send per video unless explicitly forced: the button greys out on the
+    # strength of this, so the daemon has to enforce it rather than trusting the
+    # UI -- two profiles could otherwise each send their own copy.
+    if row["emailed_at"] and not force:
+        when = perth_day(row["emailed_at"]).strftime("%d %b %H:%M")
+        return "already_sent", f"{row['emailed_to'] or 'recipient'} on {when}"
+
+    # George sends the long-form article, which is a different prompt and a
+    # different column from the on-screen summary Robert produces.
+    if not row["article"]:
+        state, text = generate_article(conn, video_id)
+        if state != "ok":
+            return state, text
+        row = conn.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+
+    # Verification gate: nothing goes out with entities the source cannot vouch
+    # for. This is the whole point of the exercise -- an article that looks
+    # right but names things the speaker never said is worse than no article.
+    if not force:
+        try:
+            flagged = verify_article(conn, video_id)
+        except CannotVerify as exc:
+            return "unverified", (f"could not check the article against its "
+                                  f"transcript ({exc}) - resend with --force to "
+                                  f"send unchecked")
+        if flagged:
+            return "unverified", ("entities not found in transcript, title or "
+                                  "description: " + ", ".join(flagged[:8])
+                                  + (" ..." if len(flagged) > 8 else "")
+                                  + " - review, add channel repairs with "
+                                    "`yth terms`, or resend with --force")
+
+    footer = summary_footer(row["article_cost"], row["article_ms"]) or "Written by yth"
+    try:
+        recipient, message_id = send_summary_email(row, row["article"], footer, to=to)
+    except Exception as exc:
+        return "error", str(exc)
+
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn.execute(
+        "UPDATE videos SET emailed_at = ?, emailed_to = ?, row_updated = ?"
+        " WHERE video_id = ?", (now, recipient, now, video_id))
+    conn.commit()
+    return "sent", f"{recipient} ({message_id})"
+
+
+def cmd_email(conn, video_id, to, force=False):
+    state, detail = email_video_summary(conn, video_id, to=to, force=force)
+    print(f"[{state}] {detail}")
+
+
+# ---------------------------------------------------------------- tracked
+
+# Discovery runs off the per-channel Atom feed rather than the Data API. It
+# costs no quota, needs no OAuth (so it keeps working when the refresh token
+# expires, which the API path does not), and carries title, description and
+# publication time already. The only thing it lacks is duration, which the
+# existing description backfill tops up when a token is available.
+FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id="
+ATOM_NS = {
+    "a": "http://www.w3.org/2005/Atom",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+    "m": "http://search.yahoo.com/mrss/",
+}
+
+
+def http_text(url, timeout=30, attempts=3):
+    """Plain GET with a browser UA, retried on transient failures.
+
+    Cloudflare fronts some of these endpoints and answers urllib's default
+    User-Agent with 'error code: 1010', so the header is not optional.
+
+    The retry is not belt-and-braces. YouTube's feed endpoint intermittently
+    answers a perfectly valid channel with 404 or 500 when several are fetched
+    in a row — observed on all four tracked channels at once, every one of which
+    then succeeded on a manual retry seconds later. Without this, one blip marks
+    a healthy channel as broken until the next poll half an hour later.
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", "replace")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
+def resolve_channel(spec):
+    """Turn a URL, @handle or raw UC id into (channel_id, handle, title).
+
+    Deliberately scrape-based rather than channels.list?forHandle: tracking must
+    keep working while the OAuth token is expired, and the page carries all
+    three fields anyway.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty channel")
+    if re.fullmatch(r"UC[A-Za-z0-9_-]{22}", spec):
+        url = f"https://www.youtube.com/channel/{spec}"
+    elif spec.startswith("@"):
+        url = f"https://www.youtube.com/{spec}"
+    elif spec.startswith("http://") or spec.startswith("https://"):
+        url = spec
+    else:
+        url = f"https://www.youtube.com/@{spec}"
+    try:
+        page = http_text(url)
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"channel page returned {exc.code}") from None
+    except Exception as exc:
+        raise ValueError(f"could not fetch channel page: {exc}") from None
+
+    m = re.search(r'"(?:externalId|channelId)":"(UC[A-Za-z0-9_-]{22})"', page)
+    if not m:
+        m = re.search(r"channel_id=(UC[A-Za-z0-9_-]{22})", page)
+    if not m:
+        raise ValueError("no channel id on that page — is it a channel URL?")
+    channel_id = m.group(1)
+
+    handle = ""
+    h = re.search(r'"canonicalBaseUrl":"/(@[A-Za-z0-9._-]+)"', page)
+    if h:
+        handle = h.group(1)
+    elif spec.startswith("@"):
+        handle = spec
+
+    title = ""
+    t = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    if t:
+        title = html.unescape(t.group(1))
+    return channel_id, handle, title
+
+
+def channel_id_from_video(video_id):
+    """Scrape a watch page for its channel id.
+
+    The Track pill needs this because `channel_url` is empty for the great
+    majority of captured rows -- the extension does not record it and the
+    description backfill never asked the API for `snippet.channelId`. Rather
+    than a schema migration plus a full re-backfill (which needs a working
+    token), resolve on demand from the one identifier every row does have.
+    """
+    page = http_text(f"https://www.youtube.com/watch?v={urllib.parse.quote(video_id)}")
+    m = re.search(r'"channelId":"(UC[A-Za-z0-9_-]{22})"', page)
+    if not m:
+        m = re.search(r'<meta itemprop="channelId" content="(UC[A-Za-z0-9_-]{22})"', page)
+    if not m:
+        raise ValueError("no channel id on that video page")
+    return m.group(1)
+
+
+def fetch_channel_feed(channel_id):
+    """Latest uploads for a channel as dicts. Newest first, up to 15."""
+    raw = http_text(FEED_URL + channel_id)
+    root = ET.fromstring(raw)
+    feed_title = root.findtext("a:title", default="", namespaces=ATOM_NS)
+    out = []
+    for e in root.findall("a:entry", ATOM_NS):
+        vid = e.findtext("yt:videoId", default="", namespaces=ATOM_NS)
+        if not vid:
+            continue
+        group = e.find("m:group", ATOM_NS)
+        desc = ""
+        if group is not None:
+            desc = group.findtext("m:description", default="",
+                                  namespaces=ATOM_NS) or ""
+        out.append({
+            "video_id": vid,
+            "title": e.findtext("a:title", default="", namespaces=ATOM_NS),
+            "published": e.findtext("a:published", default="",
+                                    namespaces=ATOM_NS),
+            "description": desc,
+            "channel": feed_title,
+        })
+    return out, feed_title
+
+
+def add_tracked_channel(conn, spec):
+    """Resolve and record a channel. Returns the row as a dict."""
+    channel_id, handle, title = resolve_channel(spec)
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    existing = conn.execute(
+        "SELECT channel_id FROM tracked_channels WHERE channel_id = ?",
+        (channel_id,)).fetchone()
+    conn.execute(
+        "INSERT INTO tracked_channels (channel_id, handle, title, added_at,"
+        " last_checked, active) VALUES (?, ?, ?, ?, 0, 1)"
+        " ON CONFLICT(channel_id) DO UPDATE SET"
+        "   handle = COALESCE(NULLIF(excluded.handle, ''), tracked_channels.handle),"
+        "   title  = COALESCE(NULLIF(excluded.title, ''), tracked_channels.title),"
+        "   active = 1",
+        (channel_id, handle, title, now))
+    conn.commit()
+    return {"channelId": channel_id, "handle": handle, "title": title,
+            "existing": existing is not None}
+
+
+def refresh_tracked(conn, quiet=False, only=None, stale_minutes=None):
+    """Poll tracked channels and record anything new.
+
+    New uploads land in `videos` (so Robert/George/the glossary all work on
+    them unchanged) AND in `tracked_items`. The two are deliberately separate:
+    `videos.hidden` belongs to History and `tracked_items.cleared_at` belongs to
+    Tracked, so clearing a notice never hides a video you might later watch.
+
+    `stale_minutes` skips channels checked recently. Opening the tab uses it so
+    a visit costs one or two fetches rather than one per tracked channel; the
+    explicit Refresh button passes None and checks everything, which is what
+    makes "I refreshed, so it is current" true.
+    """
+    say = (lambda *a: None) if quiet else print
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    where, params = "WHERE active = 1", []
+    if only:
+        where += " AND channel_id = ?"
+        params.append(only)
+    elif stale_minutes is not None:
+        where += " AND COALESCE(last_checked, 0) < ?"
+        params.append(now - stale_minutes * 60000)
+    rows = conn.execute(
+        f"SELECT channel_id, title, added_at FROM tracked_channels {where}",
+        params).fetchall()
+    checked = new = 0
+    for ch in rows:
+        cid = ch["channel_id"]
+        try:
+            entries, feed_title = fetch_channel_feed(cid)
+        except Exception as exc:
+            conn.execute("UPDATE tracked_channels SET last_error = ?,"
+                         " last_checked = ?,"
+                         " fail_count = COALESCE(fail_count, 0) + 1"
+                         " WHERE channel_id = ?",
+                         (str(exc)[:200], now, cid))
+            conn.commit()
+            say(f"  {ch['title'] or cid}: {exc}")
+            continue
+        checked += 1
+        channel_url = ""
+        hrow = conn.execute("SELECT handle FROM tracked_channels"
+                            " WHERE channel_id = ?", (cid,)).fetchone()
+        if hrow and hrow["handle"]:
+            channel_url = f"https://www.youtube.com/{hrow['handle']}"
+        for e in entries:
+            seen = conn.execute("SELECT video_id FROM tracked_items"
+                                " WHERE video_id = ?",
+                                (e["video_id"],)).fetchone()
+            published_ms = iso_to_ms(e["published"]) or now
+            # A feed always carries the last 15 uploads, so adding a channel
+            # would otherwise dump its whole back catalogue in as unread. Track
+            # 20 channels and the tab opens with 300 notices, which is not what
+            # "this channel published something new" means. Anything published
+            # before you started tracking is recorded but pre-cleared: still
+            # there under "Show cleared", just not shouting.
+            seeded = 0 if published_ms >= (ch["added_at"] or 0) else now
+            # Only descriptive fields are written, and only when the video row
+            # does not already carry them: a video you have actually watched
+            # must keep its captured position, watch count and timestamps.
+            conn.execute(
+                "INSERT INTO videos (video_id, title, channel, channel_url,"
+                " duration, last_position, watched, watch_count, live,"
+                " live_replay, first_seen, last_seen, source, row_updated,"
+                " description, published_at)"
+                # row_updated is 0, not `now`: a discovered-but-unwatched video
+                # must not enter History's /recent feed. Actually watching it
+                # makes touch() bump the stamp, and only then does it appear.
+                " VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, 'tracked', 0, ?, ?)"
+                " ON CONFLICT(video_id) DO UPDATE SET"
+                "   title = COALESCE(NULLIF(videos.title, ''), excluded.title),"
+                "   channel = COALESCE(NULLIF(videos.channel, ''), excluded.channel),"
+                "   channel_url = COALESCE(NULLIF(videos.channel_url, ''), excluded.channel_url),"
+                "   description = COALESCE(NULLIF(videos.description, ''), excluded.description),"
+                "   published_at = COALESCE(videos.published_at, excluded.published_at)",
+                (e["video_id"], e["title"], feed_title or ch["title"] or "",
+                 channel_url, published_ms, published_ms,
+                 e["description"], e["published"]))
+            conn.execute(
+                "INSERT INTO tracked_items (video_id, channel_id, published_at,"
+                " discovered_at, cleared_at, row_updated)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(video_id) DO UPDATE SET"
+                "   published_at = COALESCE(tracked_items.published_at, excluded.published_at)",
+                (e["video_id"], cid, e["published"], now, seeded, now))
+            if not seen and published_ms >= (ch["added_at"] or 0):
+                new += 1
+        conn.execute("UPDATE tracked_channels SET last_checked = ?, last_ok = ?,"
+                     " last_error = NULL, fail_count = 0"
+                     " WHERE channel_id = ?", (now, now, cid))
+        conn.commit()
+    say(f"checked {checked} channel(s), {new} new video(s)")
+    return checked, new
+
+
+def tracked_rows(conn, since, limit=1000):
+    """Tracked items changed after `since`, newest publication first.
+
+    Served on its own endpoint rather than folded into /recent: History's
+    payload schema stays put (no forced resync of the whole table), and Stats
+    cannot mistake an unwatched notice for watch time.
+    """
+    rows = conn.execute(
+        "SELECT t.*, v.title, v.channel, v.channel_url, v.duration,"
+        "       v.description, v.summary, v.summary_state, v.summary_cost,"
+        "       v.summary_ms, v.emailed_at, v.emailed_to, v.watch_count"
+        " FROM tracked_items t JOIN videos v ON v.video_id = t.video_id"
+        " WHERE t.row_updated > ?"
+        " ORDER BY t.row_updated ASC LIMIT ?",
+        (since, limit)).fetchall()
+    out = []
+    for v in rows:
+        out.append({
+            "videoId": v["video_id"],
+            "channelId": v["channel_id"],
+            "title": v["title"] or "",
+            "channel": v["channel"] or "",
+            "channelUrl": v["channel_url"] or "",
+            "duration": max(0, int(v["duration"] or 0)),
+            "publishedAt": v["published_at"] or "",
+            "discoveredAt": int(v["discovered_at"] or 0),
+            "cleared": bool(v["cleared_at"]),
+            "watchCount": int(v["watch_count"] or 0),
+            "description": re.sub(r"\s+", " ", (v["description"] or "")).strip()[:400],
+            "summary": flatten_summary(v["summary"]),
+            "summaryMeta": summary_footer(v["summary_cost"], v["summary_ms"]),
+            "summaryState": v["summary_state"] or "",
+            "emailedAt": v["emailed_at"] or 0,
+            "emailedTo": v["emailed_to"] or "",
+        })
+    cursor = rows[-1]["row_updated"] if rows else since
+    return out, cursor
+
+
+def tracked_channel_rows(conn):
+    rows = conn.execute(
+        "SELECT c.*, (SELECT COUNT(*) FROM tracked_items t"
+        "             WHERE t.channel_id = c.channel_id AND t.cleared_at = 0)"
+        "            AS pending"
+        " FROM tracked_channels c ORDER BY LOWER(c.title), c.channel_id"
+    ).fetchall()
+    return [{
+        "channelId": r["channel_id"], "handle": r["handle"] or "",
+        "title": r["title"] or r["handle"] or r["channel_id"],
+        "addedAt": r["added_at"] or 0, "lastChecked": r["last_checked"] or 0,
+        "lastOk": r["last_ok"] or 0,
+        "lastError": r["last_error"] or "",
+        "failCount": r["fail_count"] or 0,
+        # Reported as failing only after it has failed repeatedly. One bad
+        # response from YouTube's feed endpoint is routine and self-corrects;
+        # calling that "failing to check" is a false alarm on a healthy channel.
+        "failing": (r["fail_count"] or 0) >= 3,
+        "active": bool(r["active"]), "pending": r["pending"],
+    } for r in rows]
+
+
+def cmd_track(conn, action, value, quiet=False):
+    if action == "add":
+        info = add_tracked_channel(conn, value)
+        verb = "already tracked, re-enabled" if info["existing"] else "tracked"
+        print(f"{verb}: {info['title'] or info['handle'] or info['channelId']}"
+              f"  ({info['channelId']})")
+        refresh_tracked(conn, only=info["channelId"])
+        return
+    if action == "remove":
+        row = conn.execute(
+            "SELECT channel_id FROM tracked_channels"
+            " WHERE channel_id = ? OR handle = ? OR LOWER(title) = LOWER(?)",
+            (value, value, value)).fetchone()
+        if not row:
+            sys.exit(f"not tracking: {value}")
+        # Items are left in place; they are still legitimate history rows and
+        # the notice list simply stops gaining new ones.
+        conn.execute("DELETE FROM tracked_channels WHERE channel_id = ?",
+                     (row["channel_id"],))
+        conn.commit()
+        print(f"untracked {row['channel_id']}")
+        return
+    if action == "refresh":
+        refresh_tracked(conn)
+        return
+    if action == "subs":
+        rows = conn.execute("SELECT channel_id, title FROM subscriptions"
+                            " WHERE present = 1 ORDER BY LOWER(title)").fetchall()
+        if not rows:
+            sys.exit("No subscriptions synced yet. Run:  yth subs sync")
+        for r in rows:
+            print(f"{r['channel_id']}  {r['title']}")
+        print(f"\n{len(rows)} subscriptions")
+        return
+    # list
+    rows = tracked_channel_rows(conn)
+    if not rows:
+        print("No tracked channels. Add one with:  yth track add @handle")
+        return
+    for r in rows:
+        when = (datetime.fromtimestamp(r["lastChecked"] / 1000, PERTH)
+                .strftime("%d %b %H:%M") if r["lastChecked"] else "never")
+        flag = "" if r["active"] else "  [paused]"
+        err = (f"  !! failed {r['failCount']}x: {r['lastError']}"
+               if r["failing"] else "")
+        print(f"{r['title'][:40]:<40} {r['pending']:>3} new   checked {when}"
+              f"{flag}{err}")
+    print(f"\n{len(rows)} tracked channel(s)")
+
+
+# ---------------------------------------------------------------- subscriptions
+
+# Half the default 10,000/day allocation. A bug in the unsub worker can then
+# cost at most half a day's quota, and reads (likes sync, backfill, tracked)
+# keep working on the other half -- which is why the budget is checked ONLY on
+# the write path.
+QUOTA_BUDGET = 5000
+UNSUB_COST = 50
+# One removal a minute. At the budget that is 100/day, which the budget caps
+# anyway; the gap exists so a queue of 200 does not arrive as a burst.
+UNSUB_INTERVAL_SECONDS = 60
+# Activity checks read the channel's Atom feed, which costs no quota. Re-checked
+# weekly: "have they posted in years" does not change hourly.
+ACTIVITY_STALE_HOURS = 168
+
+
+def sync_subscriptions(conn, quiet=False):
+    """Pull the subscription list and merge it into the record.
+
+    part=snippet alone carries title, description, thumbnail, the channel id and
+    the date YOU subscribed -- so the whole list costs 1 unit per 50 channels
+    and no second call is needed for the UI.
+    """
+    say = (lambda *a: None) if quiet else print
+    token = access_token()
+    items, page = [], None
+    while True:
+        params = {"part": "snippet", "mine": "true", "maxResults": 50,
+                  "order": "alphabetical"}
+        if page:
+            params["pageToken"] = page
+        data = api_get("subscriptions", params, token)
+        items.extend(data.get("items", []))
+        page = data.get("nextPageToken")
+        if not page:
+            break
+
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    seen = set()
+    for it in items:
+        sn = it.get("snippet") or {}
+        cid = (sn.get("resourceId") or {}).get("channelId")
+        if not cid:
+            continue
+        seen.add(cid)
+        thumbs = sn.get("thumbnails") or {}
+        thumb = ((thumbs.get("medium") or thumbs.get("default") or {}).get("url") or "")
+        conn.execute(
+            "INSERT INTO subscriptions (channel_id, sub_id, title, description,"
+            " thumbnail, subscribed_at, synced_at, present)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
+            " ON CONFLICT(channel_id) DO UPDATE SET"
+            "   sub_id = excluded.sub_id, title = excluded.title,"
+            "   description = excluded.description, thumbnail = excluded.thumbnail,"
+            "   subscribed_at = COALESCE(subscriptions.subscribed_at, excluded.subscribed_at),"
+            "   synced_at = excluded.synced_at, present = 1",
+            (cid, it.get("id"), sn.get("title") or "", sn.get("description") or "",
+             thumb, sn.get("publishedAt") or "", now))
+    # Anything no longer returned has been unsubscribed -- by this tool or in the
+    # YouTube UI. Kept as a row so a completed removal stays visible and
+    # auditable rather than silently vanishing.
+    if seen:
+        placeholders = ",".join("?" * len(seen))
+        # Rows the queue owns are exempt. A sync that pages short would
+        # otherwise flip a queued row to present = 0, and queue_unsub's
+        # `present = 1` guard would then silently refuse to re-queue it -- a
+        # pending removal that can never run and gives no reason why.
+        conn.execute(
+            f"UPDATE subscriptions SET present = 0"
+            f" WHERE channel_id NOT IN ({placeholders})"
+            f"   AND COALESCE(unsub_state,'') NOT IN ('queued','sent')",
+            list(seen))
+    conn.commit()
+    say(f"  {len(seen)} subscriptions synced")
+    return len(seen)
+
+
+def refresh_subscription_activity(conn, limit=40, quiet=False, only=None):
+    """Fill in "when did this channel last post" from its Atom feed.
+
+    Zero quota -- the whole point, since asking the API for 493 channels' latest
+    upload would cost 493 units a pass. Staleness-gated and capped per call so
+    the background loop trickles through the list instead of firing 493 requests
+    at once, which is exactly what drew spurious 404s on the Tracked feeds.
+    """
+    say = (lambda *a: None) if quiet else print
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if only:
+        rows = conn.execute(
+            "SELECT channel_id, title FROM subscriptions WHERE channel_id = ?",
+            (only,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT channel_id, title FROM subscriptions"
+            " WHERE present = 1 AND COALESCE(unsub_state,'') NOT IN ('done','sent')"
+            "   AND COALESCE(activity_at, 0) < ?"
+            " ORDER BY COALESCE(activity_at, 0) ASC LIMIT ?",
+            (now - ACTIVITY_STALE_HOURS * 3600000, limit)).fetchall()
+    checked = 0
+    for r in rows:
+        cid = r["channel_id"]
+        try:
+            entries, _ = fetch_channel_feed(cid)
+        except Exception as exc:
+            conn.execute(
+                "UPDATE subscriptions SET activity_at = ?, activity_error = ?"
+                " WHERE channel_id = ?", (now, str(exc)[:160], cid))
+            conn.commit()
+            continue
+        latest = max((e["published"] for e in entries), default="")
+        conn.execute(
+            "UPDATE subscriptions SET last_upload_at = ?, upload_count = ?,"
+            " activity_at = ?, activity_error = NULL WHERE channel_id = ?",
+            (latest, len(entries), now, cid))
+        conn.commit()
+        checked += 1
+    say(f"  activity checked for {checked} channel(s)")
+    return checked
+
+
+def backfill_channel_ids(conn, limit=200, quiet=False):
+    """Attach snippet.channelId to watched videos.
+
+    Without this, "when did I last watch this channel" has to match on display
+    name, which is fuzzy and breaks on a rename. videos.list already returns the
+    id on the call the description backfill makes, so this is the same 1 unit
+    per 50 videos and no new API surface.
+    """
+    say = (lambda *a: None) if quiet else print
+    pending = [r["video_id"] for r in conn.execute(
+        "SELECT video_id FROM videos WHERE channel_id IS NULL"
+        " ORDER BY last_seen DESC LIMIT ?", (limit,))]
+    if not pending:
+        return 0
+    token = access_token()
+    found = 0
+    for i in range(0, len(pending), 50):
+        chunk = pending[i:i + 50]
+        data = api_get("videos", {"part": "snippet", "id": ",".join(chunk)}, token)
+        got = {item["id"]: (item.get("snippet") or {}).get("channelId") or ""
+               for item in data.get("items") or []}
+        # One transaction per 50-video chunk, not one per row. A row-at-a-time
+        # loop holds the write lock across the whole batch and loses to the
+        # daemon's likes sync, which can hold it for tens of seconds.
+        conn.executemany(
+            "UPDATE videos SET channel_id = ? WHERE video_id = ?",
+            # "" rather than left NULL for videos the API will not return, so a
+            # deleted video is not re-queried on every pass forever.
+            [(got.get(vid, ""), vid) for vid in chunk])
+        conn.commit()
+        found += sum(1 for vid in chunk if got.get(vid))
+    say(f"  channel ids: {len(pending)} checked, {found} resolved")
+    return found
+
+
+def _norm_channel(name):
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def subscription_rows(conn):
+    """Every subscription, joined to what the record knows about engagement.
+
+    The engagement figures are honest about their own provenance. Real watch
+    data only exists from when the extension was installed; likes go back years.
+    `lastViewed` is therefore the later of "last watched" and "last liked", and
+    `lastViewedKind` says which one it actually is, so the UI can label the
+    column for what it measures rather than implying it saw you watch something
+    in 2015.
+    """
+    # Exact match on channel_id where the backfill has supplied it, falling back
+    # to a normalised display name for rows it has not reached yet.
+    by_id, by_name = {}, {}
+    for r in conn.execute(
+            "SELECT v.channel_id, v.channel, v.video_id, l.liked_at,"
+            "       (SELECT COALESCE(MAX(s.watched_at), 0) FROM sessions s"
+            "         WHERE s.video_id = v.video_id) AS watched_at"
+            "  FROM videos v LEFT JOIN likes l ON l.video_id = v.video_id"
+            " WHERE NOT " + UNWATCHED_TRACKED):
+        stat = {"videos": 0, "likes": 0, "watched": 0,
+                "last_like": 0, "last_watch": 0}
+        for bucket, key in ((by_id, r["channel_id"]), (by_name, _norm_channel(r["channel"]))):
+            if not key:
+                continue
+            st = bucket.setdefault(key, dict(stat))
+            st["videos"] += 1
+            if r["liked_at"]:
+                st["likes"] += 1
+                st["last_like"] = max(st["last_like"], r["liked_at"])
+            if r["watched_at"]:
+                st["watched"] += 1
+                st["last_watch"] = max(st["last_watch"], r["watched_at"])
+
+    tracked = {r["channel_id"] for r in conn.execute(
+        "SELECT channel_id FROM tracked_channels")}
+
+    out = []
+    for r in conn.execute("SELECT * FROM subscriptions ORDER BY LOWER(title)"):
+        st = by_id.get(r["channel_id"]) or by_name.get(_norm_channel(r["title"])) \
+            or {"videos": 0, "likes": 0, "watched": 0, "last_like": 0, "last_watch": 0}
+        last_watch, last_like = st["last_watch"], st["last_like"]
+        if last_watch >= last_like and last_watch:
+            last_viewed, kind = last_watch, "watched"
+        elif last_like:
+            last_viewed, kind = last_like, "liked"
+        else:
+            last_viewed, kind = 0, "never"
+        out.append({
+            "channelId": r["channel_id"],
+            "subId": r["sub_id"] or "",
+            "title": r["title"] or "",
+            "description": re.sub(r"\s+", " ", (r["description"] or "")).strip()[:400],
+            "thumbnail": r["thumbnail"] or "",
+            "subscribedAt": r["subscribed_at"] or "",
+            "lastUploadAt": r["last_upload_at"] or "",
+            "uploadCount": r["upload_count"] or 0,
+            "activityChecked": r["activity_at"] or 0,
+            "activityError": r["activity_error"] or "",
+            "lastViewed": last_viewed,
+            "lastViewedKind": kind,
+            "videos": st["videos"], "likes": st["likes"], "watched": st["watched"],
+            "tracked": r["channel_id"] in tracked,
+            "present": bool(r["present"]),
+            "unsubState": r["unsub_state"] or "",
+            "unsubQueuedAt": r["unsub_queued_at"] or 0,
+            "unsubError": r["unsub_error"] or "",
+        })
+    return out
+
+
+def queue_warnings(conn, channel_ids):
+    """Queued channels you may not have meant to drop.
+
+    Queueing is a bulk action with no per-row confirmation, by design -- the
+    point is to select a lot at once. So the warning comes after the fact and
+    before the minute elapses: a channel you track, or have liked videos from,
+    is one mis-click from an irreversible removal otherwise.
+    """
+    if not channel_ids:
+        return []
+    marks = ",".join("?" * len(channel_ids))
+    rows = conn.execute(
+        f"SELECT s.channel_id, s.title,"
+        f"  (SELECT COUNT(*) FROM tracked_channels t"
+        f"    WHERE t.channel_id = s.channel_id) AS tracked,"
+        f"  (SELECT COUNT(*) FROM videos v JOIN likes l ON l.video_id = v.video_id"
+        f"    WHERE v.channel_id = s.channel_id) AS likes"
+        f" FROM subscriptions s WHERE s.channel_id IN ({marks})",
+        list(channel_ids)).fetchall()
+    out = []
+    for r in rows:
+        why = []
+        if r["tracked"]:
+            why.append("on the Tracked tab")
+        if r["likes"]:
+            why.append(f"{r['likes']} liked video(s)")
+        if why:
+            out.append({"channelId": r["channel_id"], "title": r["title"] or "",
+                        "why": " and ".join(why)})
+    return out
+
+
+def queue_unsub(conn, channel_ids, cancel=False):
+    """Mark channels for removal, or take them back off the queue.
+
+    Nothing is sent here. The worker drains the queue slowly and within budget,
+    which is what makes "select a lot and let it run" safe: until a row reaches
+    'sent' it can still be cancelled.
+    """
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    changed = 0
+    for cid in channel_ids:
+        if cancel:
+            cur = conn.execute(
+                "UPDATE subscriptions SET unsub_state = NULL, unsub_queued_at = 0,"
+                " unsub_error = NULL"
+                " WHERE channel_id = ? AND unsub_state = 'queued'", (cid,))
+        else:
+            # Only a live subscription can be queued, and never one already sent:
+            # re-queueing a completed removal would spend 50 units on a 404.
+            cur = conn.execute(
+                "UPDATE subscriptions SET unsub_state = 'queued', unsub_queued_at = ?,"
+                " unsub_error = NULL"
+                " WHERE channel_id = ? AND present = 1"
+                "   AND COALESCE(unsub_state,'') NOT IN ('queued','sent','done')",
+                (now, cid))
+        changed += cur.rowcount
+    conn.commit()
+    return changed
+
+
+def unsub_budget(conn):
+    """What the write path is allowed to spend right now, and what is stopping it.
+
+    `blocked` matters as much as the numbers: a queue that cannot run because
+    the write scope was never authorised looks identical, from the UI, to one
+    that is simply waiting its turn.
+    """
+    used, _ = quota_spent(conn)
+    remaining = max(0, QUOTA_BUDGET - used)
+    pending = conn.execute("SELECT COUNT(*) FROM subscriptions"
+                           " WHERE unsub_state = 'queued'").fetchone()[0]
+    blocked, detail = "", ""
+    if pending and not WRITE_CREDS_PATH.exists():
+        blocked = "auth"
+        detail = ("Unsubscribing is not authorised yet. Run"
+                  " `yth auth --write --from-env` and approve in the browser;"
+                  " the queue starts on its own afterwards.")
+    elif pending and remaining < UNSUB_COST:
+        blocked = "budget"
+        detail = (f"Daily quota budget reached ({used}/{QUOTA_BUDGET} units)."
+                  f" The queue resumes after midnight US Pacific.")
+    return {"day": pacific_day(), "used": used, "budget": QUOTA_BUDGET,
+            "remaining": remaining, "unsubsLeft": remaining // UNSUB_COST,
+            "pending": pending, "blocked": blocked, "blockedDetail": detail}
+
+
+def drain_unsub_queue(conn, max_items=1, quiet=False):
+    """Send at most `max_items` queued removals, honouring the daily budget.
+
+    Deliberately one at a time by default: the caller is a background loop with
+    a minute between passes, so a queue of 200 is spread over hours instead of
+    arriving as a burst that trips rate limits.
+    """
+    say = (lambda *a: None) if quiet else print
+    sent, blocked = 0, None
+    for _ in range(max_items):
+        budget = unsub_budget(conn)
+        if budget["remaining"] < UNSUB_COST:
+            blocked = "budget"
+            break
+        row = conn.execute(
+            "SELECT channel_id, sub_id, title FROM subscriptions"
+            " WHERE unsub_state = 'queued' ORDER BY unsub_queued_at ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            break
+
+        # Re-verify the subscription id immediately before use. It changes if
+        # you unsubscribe and resubscribe, and a stale id would spend 50 units
+        # to delete nothing -- or, worse, something else.
+        try:
+            token = access_token(WRITE_CREDS_PATH)
+        except SystemExit as exc:
+            conn.execute("UPDATE subscriptions SET unsub_error = ?"
+                         " WHERE channel_id = ?", (str(exc)[:200], row["channel_id"]))
+            conn.commit()
+            blocked = "auth"
+            break
+
+        live = api_get("subscriptions", {"part": "snippet", "mine": "true",
+                                         "forChannelId": row["channel_id"],
+                                         "maxResults": 1}, token)
+        items = live.get("items") or []
+        if not items:
+            # Already gone -- unsubscribed in the YouTube UI, or a previous send
+            # that succeeded before we recorded it. Not an error, and not worth
+            # 50 units to confirm.
+            conn.execute(
+                "UPDATE subscriptions SET unsub_state = 'done', present = 0,"
+                " unsub_done_at = ?, unsub_error = NULL WHERE channel_id = ?",
+                (int(datetime.now(timezone.utc).timestamp() * 1000), row["channel_id"]))
+            conn.commit()
+            say(f"  already gone: {row['title']}")
+            continue
+
+        sub_id = items[0]["id"]
+        conn.execute("UPDATE subscriptions SET unsub_state = 'sent', sub_id = ?"
+                     " WHERE channel_id = ?", (sub_id, row["channel_id"]))
+        conn.commit()
+        # Debit BEFORE the call. A crash between issuing the delete and
+        # recording its cost would otherwise lose the 50 units, and the next
+        # start would re-spend them.
+        record_quota(UNSUB_COST, "subscriptions.delete")
+        try:
+            api_delete("subscriptions", {"id": sub_id}, token)
+        except Exception as exc:
+            conn.execute(
+                "UPDATE subscriptions SET unsub_state = 'failed', unsub_error = ?"
+                " WHERE channel_id = ?", (str(exc)[:200], row["channel_id"]))
+            conn.commit()
+            say(f"  FAILED {row['title']}: {exc}")
+            blocked = "error"
+            break
+        conn.execute(
+            "UPDATE subscriptions SET unsub_state = 'done', present = 0,"
+            " unsub_done_at = ?, unsub_error = NULL WHERE channel_id = ?",
+            (int(datetime.now(timezone.utc).timestamp() * 1000), row["channel_id"]))
+        conn.commit()
+        sent += 1
+        # Logged with the title, not just an id: this is the audit trail for an
+        # irreversible change made on the user's behalf, possibly days after
+        # they asked for it.
+        say(f"  unsubscribed: {row['title']} ({row['channel_id']})")
+    return sent, blocked
+
+
+def cmd_subs(conn, action, value=None):
+    if action == "sync":
+        sync_subscriptions(conn)
+        return
+    if action == "activity":
+        refresh_subscription_activity(conn, limit=int(value) if value else 40)
+        return
+    if action == "queue":
+        n = queue_unsub(conn, [value])
+        print(f"queued {n}")
+        return
+    if action == "cancel":
+        if value:
+            n = queue_unsub(conn, [value], cancel=True)
+        else:
+            n = conn.execute(
+                "UPDATE subscriptions SET unsub_state = NULL, unsub_queued_at = 0"
+                " WHERE unsub_state = 'queued'").rowcount
+            conn.commit()
+        print(f"cancelled {n}")
+        return
+    if action == "drain":
+        sent, blocked = drain_unsub_queue(conn, max_items=int(value) if value else 1)
+        print(f"sent {sent}" + (f", stopped: {blocked}" if blocked else ""))
+        return
+    if action == "quota":
+        b = unsub_budget(conn)
+        used, calls = quota_spent(conn)
+        print(f"quota day {b['day']} (resets midnight US Pacific)")
+        print(f"  spent   {used} of {b['budget']} budgeted ({calls} calls)")
+        print(f"  allows  {b['unsubsLeft']} more unsubscribe(s) today")
+        return
+    # list
+    rows = subscription_rows(conn)
+    if not rows:
+        print("No subscriptions synced yet. Run:  yth subs sync")
+        return
+    queued = [r for r in rows if r["unsubState"] == "queued"]
+    never = [r for r in rows if r["lastViewedKind"] == "never"]
+    dormant = [r for r in rows if r["lastUploadAt"]
+               and iso_to_ms(r["lastUploadAt"]) < int(
+                   (datetime.now(timezone.utc) - timedelta(days=365)).timestamp() * 1000)]
+    print(f"{len(rows)} subscriptions"
+          f" · {len(never)} never viewed"
+          f" · {len(dormant)} dormant (no upload in a year)"
+          f" · {len(queued)} queued to unsubscribe")
+    for r in sorted(rows, key=lambda r: r["lastViewed"]):
+        when = (datetime.fromtimestamp(r["lastViewed"] / 1000, PERTH).strftime("%b %Y")
+                if r["lastViewed"] else "never")
+        up = r["lastUploadAt"][:10] if r["lastUploadAt"] else "?"
+        flag = " [queued]" if r["unsubState"] == "queued" else ""
+        print(f"  {r['title'][:38]:<38} viewed {when:<9} ({r['lastViewedKind']:<7})"
+              f" last upload {up}{flag}")
+
+
+# ---------------------------------------------------------------- daemon
+
+TOKEN_PATH = CONFIG_DIR / "daemon-token"
+DEFAULT_PORT = 8742
+
+# Bump whenever a field is ADDED to or changed in the /recent payload. Clients
+# store the version they last merged; on a mismatch they reset their cursor and
+# re-pull everything, because rows they already consumed are otherwise never
+# re-sent and would keep the old shape forever. Adding a field without bumping
+# this is the bug that has bitten three times: description, summary, summaryMeta.
+PAYLOAD_SCHEMA = 5
+# Tracked has its own payload version, deliberately independent of History's.
+# Changing the notice list must never force a resync of the 1,300-row watch
+# history, and vice versa.
+TRACKED_SCHEMA = 1
+# How often the daemon polls the Atom feeds. Feeds are cheap but not free to
+# YouTube, and channels do not publish more than a few times a day.
+TRACKED_POLL_MINUTES = 30
+# Opening the Tracked tab polls only channels staler than this, so a visit with
+# 30 channels tracked is one or two fetches rather than thirty serial ones.
+TRACKED_STALE_MINUTES = 15
+# Independent of History's and Tracked's, for the same reason those are
+# independent of each other.
+SUBS_SCHEMA = 1
+# The cursor and the 500-row page cap bound each response, so this window only
+# needs to be wide enough to cover anything the History tab still shows. At 21
+# days, rows older than that could never receive later enrichment (descriptions
+# were added long after most rows were first synced) and stayed blank forever.
+# Effectively unbounded: the cursor and the 500-row page cap are what bound a
+# response. A tighter window silently strips rows that clients then never see
+# enrichment for -- at 3650 days it quietly dropped the oldest 2015 likes.
+# Narrow it deliberately (?days=N) if you ever want the extension to hold less.
+SERVE_WINDOW_DAYS = 36500
+
+
+def daemon_token():
+    """Shared secret the extension must present.
+
+    Localhost alone is not access control: any page you visit can issue a
+    cross-origin POST to 127.0.0.1. Requiring a custom header forces a CORS
+    preflight, which we only answer for chrome-extension:// origins.
+    """
+    if TOKEN_PATH.exists():
+        return TOKEN_PATH.read_text().strip()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tok = secrets.token_urlsafe(24)
+    TOKEN_PATH.write_text(tok)
+    TOKEN_PATH.chmod(0o600)
+    return tok
+
+
+def touch(conn, video_ids):
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn.executemany("UPDATE videos SET row_updated = ? WHERE video_id = ?",
+                     [(now, v) for v in video_ids])
+
+
+def ingest_records(conn, videos, sessions, events):
+    """Merge a push from the extension. Same rules as a file import."""
+    payload = {"history": videos, "watchSessions": sessions, "watchEvents": events}
+    tmp = CONFIG_DIR / "ingest.tmp.json"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(payload))
+    try:
+        new_v, new_s, new_e, *_ = do_import(conn, tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
+    touch(conn, [video_id_of(v) for v in videos if video_id_of(v)])
+    conn.commit()
+    return new_v, new_s, new_e
+
+
+def flatten_summary(text):
+    """Markdown to one readable line for the History column.
+
+    The model answers in markdown; the column sets textContent, so asterisks
+    would show literally. Bullets become "* " so the structure survives the
+    three-line clamp. The raw markdown stays in the record for any richer UI.
+    """
+    if not text:
+        return ""
+    out = re.sub(r"\*\*(.+?)\*\*", r"\1", text)          # bold
+    out = re.sub(r"(?m)^\s*[-*\u2022]\s+", "\u2022 ", out)  # list markers
+    out = re.sub(r"(?m)^#{1,6}\s*", "", out)                # headings
+    out = re.sub(r"\s*\n\s*", "  ", out)
+    return re.sub(r"\s{3,}", "  ", out).strip()
+
+
+def serve_rows(conn, since, days):
+    """Rows changed after `since`, limited to the retention window."""
+    cutoff = int((datetime.now(PERTH) - timedelta(days=days)).timestamp() * 1000)
+    rows = conn.execute(
+        "SELECT v.*, l.video_id IS NOT NULL AS liked FROM videos v"
+        " LEFT JOIN likes l ON l.video_id = v.video_id"
+        " WHERE v.row_updated > ? AND v.last_seen >= ?"
+        " ORDER BY v.row_updated ASC LIMIT 500",
+        (since, cutoff)).fetchall()
+    out = []
+    for v in rows:
+        out.append({
+            "videoId": v["video_id"], "title": v["title"] or "",
+            "channel": v["channel"] or "", "channelUrl": v["channel_url"] or "",
+            "time": max(0, min(86400, int(v["last_position"] or 0))),
+            "duration": max(0, int(v["duration"] or 0)),
+            "watched": bool(v["watched"]), "watchCount": int(v["watch_count"] or 0),
+            "timestamp": int(v["last_seen"] or 0),
+            "liked": bool(v["liked"]), "hidden": bool(v["hidden"]),
+            # Trimmed and flattened for the wire: the column clamps to three
+            # lines, and a description's own blank lines would otherwise eat
+            # them. Full text stays in the record.
+            "description": re.sub(r"\s+", " ", (v["description"] or "")).strip()[:400],
+            # Sent in full: a summary is short by construction and is the
+            # primary thing the row displays once it exists.
+            "summary": flatten_summary(v["summary"]),
+            "summaryMeta": summary_footer(v["summary_cost"], v["summary_ms"]),
+            "emailedAt": v["emailed_at"] or 0,
+            "emailedTo": v["emailed_to"] or "",
+            "summaryState": v["summary_state"] or "",
+            **({"live": True} if v["live"] else {}),
+            **({"liveReplay": True} if v["live_replay"] else {}),
+        })
+    cursor = rows[-1]["row_updated"] if rows else since
+    return out, cursor
+
+
+def cmd_serve(db_path, port, sync_minutes):
+    token = daemon_token()
+    print(f"Token: {token}")
+    print(f"       (paste into the extension's options page; also at {TOKEN_PATH})")
+
+    lock = threading.Lock()
+    # Separate from `lock`: a refresh is N sequential feed fetches, and running
+    # two at once (the 30-minute loop firing while you click Refresh) would
+    # double the requests to YouTube for identical results. Non-blocking, so a
+    # click during a background poll returns immediately rather than hanging.
+    tracked_lock = threading.Lock()
+    subs_lock = threading.Lock()
+
+    def open_conn():
+        c = connect(db_path)
+        c.execute("PRAGMA journal_mode=WAL")
+        return c
+
+    def likes_loop():
+        while True:
+            try:
+                with lock:
+                    c = open_conn()
+                    before = c.execute("SELECT COUNT(*) FROM likes").fetchone()[0]
+                    cmd_sync_likes(c, quiet=True)
+                    after = c.execute("SELECT COUNT(*) FROM likes").fetchone()[0]
+                    # Surface newly-liked videos to clients even though the like
+                    # itself does not change the videos row.
+                    c.execute(
+                        "UPDATE videos SET row_updated = ? WHERE video_id IN"
+                        " (SELECT video_id FROM likes)"
+                        " AND row_updated < (SELECT liked_at FROM likes"
+                        "                    WHERE likes.video_id = videos.video_id)",
+                        (int(datetime.now(timezone.utc).timestamp() * 1000),))
+                    c.commit()
+                    # Backfill BEFORE closing. This previously ran after
+                    # c.close() and failed every cycle with "Cannot operate on a
+                    # closed database", so descriptions were never topped up in
+                    # the background at all -- only ever by an explicit
+                    # `yth backfill`.
+                    _, filled = backfill_descriptions(c, limit=200, quiet=True)
+                    c.commit()
+                    ids = backfill_channel_ids(c, limit=200, quiet=True)
+                    c.commit()
+                    c.close()
+                    stamp = datetime.now(PERTH).strftime("%H:%M")
+                    if after != before:
+                        print(f"[{stamp}] likes: +{after - before}")
+                    if filled:
+                        print(f"[{stamp}] descriptions: +{filled}")
+                    if ids:
+                        print(f"[{stamp}] channel ids: +{ids}")
+            except SystemExit as exc:
+                print(f"[likes] sync failed: {exc}")
+            except Exception as exc:
+                print(f"[likes] error: {exc}")
+            __import__("time").sleep(max(60, sync_minutes * 60))
+
+    def tracked_loop():
+        # Separate thread from likes_loop on purpose: feed polling needs no
+        # OAuth, so an expired refresh token must not stop it.
+        while True:
+            try:
+                if not tracked_lock.acquire(blocking=False):
+                    checked = new = 0          # a manual Refresh is already running
+                else:
+                    try:
+                        c = open_conn()
+                        try:
+                            checked, new = refresh_tracked(c, quiet=True)
+                        finally:
+                            c.close()
+                    finally:
+                        tracked_lock.release()
+                if new:
+                    stamp = datetime.now(PERTH).strftime("%H:%M")
+                    print(f"[{stamp}] tracked: +{new} from {checked} channel(s)")
+            except Exception as exc:
+                print(f"[tracked] error: {exc}")
+            __import__("time").sleep(TRACKED_POLL_MINUTES * 60)
+
+    def subs_loop():
+        """Trickle work that must not arrive as a burst.
+
+        Activity checks are free but are 491 HTTP requests, so they go a few at
+        a time. Unsubscribes are irreversible and metered, so exactly one per
+        pass -- a queue of 200 spreads over hours rather than hitting the API as
+        a block, and there is a minute in which to cancel between each one.
+        """
+        warned_day = None
+        while True:
+            try:
+                c = open_conn()
+                try:
+                    refresh_subscription_activity(c, limit=8, quiet=True)
+                    if subs_lock.acquire(blocking=False):
+                        try:
+                            sent, blocked = drain_unsub_queue(c, max_items=1, quiet=False)
+                        finally:
+                            subs_lock.release()
+                        budget = unsub_budget(c)
+                        pending = c.execute(
+                            "SELECT COUNT(*) FROM subscriptions"
+                            " WHERE unsub_state = 'queued'").fetchone()[0]
+                        # Warned once per quota day, not once per minute: the
+                        # loop would otherwise fill the log with the same line
+                        # every 60 seconds for the rest of the day.
+                        if (blocked == "budget" and pending
+                                and warned_day != budget["day"]):
+                            warned_day = budget["day"]
+                            stamp = datetime.now(PERTH).strftime("%H:%M")
+                            print(f"[{stamp}] QUOTA BUDGET REACHED"
+                                  f" ({budget['used']}/{budget['budget']} units)."
+                                  f" {pending} unsubscribe(s) still queued; they"
+                                  f" resume after midnight US Pacific.")
+                            notify_budget_reached(budget, pending)
+                finally:
+                    c.close()
+            except Exception as exc:
+                print(f"[subs] error: {exc}")
+            __import__("time").sleep(UNSUB_INTERVAL_SECONDS)
+
+    threading.Thread(target=likes_loop, daemon=True).start()
+    threading.Thread(target=tracked_loop, daemon=True).start()
+    threading.Thread(target=subs_loop, daemon=True).start()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "yth"
+
+        def _cors(self):
+            origin = self.headers.get("Origin", "")
+            if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-YTH-Token")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+        def _authed(self):
+            if self.headers.get("X-YTH-Token") == token:
+                return True
+            self.send_response(403); self._cors(); self.end_headers()
+            self.wfile.write(b'{"error":"bad token"}')
+            return False
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors(); self.end_headers(); self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(204); self._cors(); self.end_headers()
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if u.path == "/health":
+                return self._json({"ok": True, "service": "yth"})
+            if not self._authed():
+                return
+            if u.path == "/recent":
+                since = int((q.get("since") or ["0"])[0])
+                days = int((q.get("days") or [SERVE_WINDOW_DAYS])[0])
+                # Deliberately lock-free. The likes sync and description
+                # backfill can hold the write lock for tens of seconds, and
+                # queueing reads behind them would hang the History tab every
+                # time one ran. WAL gives readers a consistent snapshot without
+                # blocking the writer.
+                c = open_conn()
+                try:
+                    rows, cursor = serve_rows(c, since, days)
+                finally:
+                    c.close()
+                return self._json({"videos": rows, "cursor": cursor,
+                                   "count": len(rows), "schema": PAYLOAD_SCHEMA})
+            if u.path == "/tracked":
+                since = int((q.get("since") or ["0"])[0])
+                limit = 1000
+                c = open_conn()
+                try:
+                    rows, cursor = tracked_rows(c, since, limit)
+                    channels = tracked_channel_rows(c)
+                finally:
+                    c.close()
+                # `more` rather than a silent truncation: the client pages on
+                # the cursor until it is false.
+                return self._json({"videos": rows, "cursor": cursor,
+                                   "count": len(rows), "channels": channels,
+                                   "more": len(rows) == limit,
+                                   "schema": TRACKED_SCHEMA})
+            if u.path == "/subs":
+                c = open_conn()
+                try:
+                    rows = subscription_rows(c)
+                    budget = unsub_budget(c)
+                finally:
+                    c.close()
+                return self._json({"subscriptions": rows, "count": len(rows),
+                                   "budget": budget, "schema": SUBS_SCHEMA})
+            if u.path == "/subs-quota":
+                c = open_conn()
+                try:
+                    return self._json(unsub_budget(c))
+                finally:
+                    c.close()
+            if u.path == "/tracked-channels":
+                c = open_conn()
+                try:
+                    return self._json({"channels": tracked_channel_rows(c)})
+                finally:
+                    c.close()
+            if u.path == "/subscriptions":
+                # Served from the synced table when there is one: the Tracked
+                # picker used to spend 10 quota units re-listing 491 channels
+                # every time it was opened, for a list the Subscriptions tab
+                # already keeps current. Falls back to a live call so the
+                # picker still works before the first sync.
+                c = open_conn()
+                try:
+                    rows = c.execute(
+                        "SELECT channel_id, title FROM subscriptions"
+                        " WHERE present = 1 ORDER BY LOWER(title)").fetchall()
+                finally:
+                    c.close()
+                if rows:
+                    return self._json({"subscriptions": [
+                        {"channelId": r["channel_id"], "title": r["title"] or ""}
+                        for r in rows]})
+                return self._json({"error": "No subscriptions synced yet."
+                                            " Open the Subscriptions tab and"
+                                            " press Sync from YouTube."}, 200)
+            self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            if not self._authed():
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return self._json({"error": "bad json"}, 400)
+
+            if u.path == "/ingest":
+                with lock:
+                    c = open_conn()
+                    try:
+                        nv, ns, ne = ingest_records(
+                            c, body.get("videos") or [], body.get("sessions") or [],
+                            body.get("events") or [])
+                    except ExportFormatError as exc:
+                        c.close()
+                        return self._json({"error": str(exc)}, 400)
+                    c.close()
+                return self._json({"newVideos": nv, "newSessions": ns, "newEvents": ne})
+
+            if u.path == "/summarize":
+                vid = body.get("videoId")
+                if not vid:
+                    return self._json({"error": "videoId required"}, 400)
+                # Deliberately outside `lock`: this runs a subprocess and an LLM
+                # call, ~5-10s, and holding the write lock for that would stall
+                # every ingest and pull from both browsers.
+                c = open_conn()
+                try:
+                    state, text = summarise_video(c, vid)
+                finally:
+                    c.close()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] summarise {vid}: {state}")
+                if state == "ok":
+                    return self._json({"state": state, "summary": text})
+                return self._json({"state": state, "error": text}, 200)
+
+            if u.path == "/email-summary":
+                vid = body.get("videoId")
+                if not vid:
+                    return self._json({"error": "videoId required"}, 400)
+                c = open_conn()
+                try:
+                    state, detail = email_video_summary(
+                        c, vid, to=body.get("to"), force=bool(body.get("force")))
+                finally:
+                    c.close()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] email {vid}: {state} {detail}")
+                if state in ("sent", "already_sent"):
+                    return self._json({"state": state, "detail": detail})
+                return self._json({"state": state, "error": detail}, 200)
+
+            if u.path == "/hide":
+                vid = body.get("videoId")
+                if not vid:
+                    return self._json({"error": "videoId required"}, 400)
+                now = int(datetime.now(timezone.utc).timestamp() * 1000)
+                with lock:
+                    c = open_conn()
+                    c.execute("UPDATE videos SET hidden = 1, row_updated = ?"
+                              " WHERE video_id = ?", (now, vid))
+                    c.commit(); c.close()
+                return self._json({"hidden": vid})
+
+            if u.path == "/tracked-clear":
+                vid = body.get("videoId")
+                if not vid:
+                    return self._json({"error": "videoId required"}, 400)
+                now = int(datetime.now(timezone.utc).timestamp() * 1000)
+                undo = bool(body.get("undo"))
+                with lock:
+                    c = open_conn()
+                    c.execute("UPDATE tracked_items SET cleared_at = ?,"
+                              " row_updated = ? WHERE video_id = ?",
+                              (0 if undo else now, now, vid))
+                    c.commit(); c.close()
+                return self._json({"cleared": vid, "undo": undo})
+
+            if u.path == "/tracked-add":
+                spec = (body.get("channel") or "").strip()
+                if not spec and body.get("videoId"):
+                    # Fallback for History rows with no channel_url recorded,
+                    # which is most of them.
+                    try:
+                        spec = channel_id_from_video(body["videoId"])
+                    except Exception as exc:
+                        return self._json({"error": f"could not find the channel"
+                                                    f" for that video: {exc}"}, 200)
+                if not spec:
+                    return self._json({"error": "channel required"}, 400)
+                with lock:
+                    c = open_conn()
+                    try:
+                        info = add_tracked_channel(c, spec)
+                        refresh_tracked(c, quiet=True, only=info["channelId"])
+                    except ValueError as exc:
+                        c.close()
+                        return self._json({"error": str(exc)}, 200)
+                    channels = tracked_channel_rows(c)
+                    c.close()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] tracked +{info['channelId']}"
+                      f" {info['title'] or info['handle']}")
+                return self._json({"added": info, "channels": channels})
+
+            if u.path == "/tracked-remove":
+                cid = body.get("channelId")
+                if not cid:
+                    return self._json({"error": "channelId required"}, 400)
+                with lock:
+                    c = open_conn()
+                    c.execute("DELETE FROM tracked_channels WHERE channel_id = ?",
+                              (cid,))
+                    c.commit()
+                    channels = tracked_channel_rows(c)
+                    c.close()
+                return self._json({"removed": cid, "channels": channels})
+
+            if u.path == "/subs-queue":
+                ids = body.get("channelIds") or []
+                if not ids:
+                    return self._json({"error": "channelIds required"}, 400)
+                cancel = bool(body.get("cancel"))
+                with lock:
+                    c = open_conn()
+                    n = queue_unsub(c, ids, cancel=cancel)
+                    warnings = [] if cancel else queue_warnings(c, ids)
+                    rows = subscription_rows(c)
+                    budget = unsub_budget(c)
+                    c.close()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] unsub {'cancel' if cancel else 'queue'}: {n} channel(s)")
+                for w in warnings:
+                    print(f"[{stamp}]   note: {w['title']} is {w['why']}")
+                return self._json({"changed": n, "subscriptions": rows,
+                                   "budget": budget, "warnings": warnings})
+
+            if u.path == "/subs-cancel-all":
+                with lock:
+                    c = open_conn()
+                    n = c.execute(
+                        "UPDATE subscriptions SET unsub_state = NULL,"
+                        " unsub_queued_at = 0 WHERE unsub_state = 'queued'").rowcount
+                    c.commit()
+                    rows = subscription_rows(c)
+                    budget = unsub_budget(c)
+                    c.close()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] unsub queue cleared: {n} channel(s)")
+                return self._json({"changed": n, "subscriptions": rows,
+                                   "budget": budget})
+
+            if u.path == "/subs-sync":
+                if not subs_lock.acquire(blocking=False):
+                    return self._json({"busy": True})
+                try:
+                    c = open_conn()
+                    try:
+                        n = sync_subscriptions(c, quiet=True)
+                        rows = subscription_rows(c)
+                        budget = unsub_budget(c)
+                    finally:
+                        c.close()
+                except SystemExit as exc:
+                    return self._json({"error": str(exc)}, 200)
+                finally:
+                    subs_lock.release()
+                return self._json({"synced": n, "subscriptions": rows,
+                                   "budget": budget})
+
+            if u.path == "/tracked-refresh":
+                # Outside `lock`: N sequential feed fetches would otherwise
+                # stall every ingest and pull from both browsers.
+                if not tracked_lock.acquire(blocking=False):
+                    return self._json({"checked": 0, "new": 0, "busy": True})
+                # Opening the tab sends no force flag, so it costs a fetch only
+                # for channels nothing has checked lately; the Refresh button
+                # sends force and checks the lot.
+                stale = None if body.get("force") else TRACKED_STALE_MINUTES
+                try:
+                    c = open_conn()
+                    try:
+                        checked, new = refresh_tracked(c, quiet=True,
+                                                       stale_minutes=stale)
+                    finally:
+                        c.close()
+                finally:
+                    tracked_lock.release()
+                stamp = datetime.now(PERTH).strftime("%H:%M")
+                print(f"[{stamp}] tracked refresh: {checked} channels, {new} new")
+                return self._json({"checked": checked, "new": new})
+
+            self._json({"error": "not found"}, 404)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    try:
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        # Autostart may race with a daemon you already have running; a second
+        # copy is pointless rather than harmful, so say so and exit cleanly.
+        if exc.errno in (98, 48):   # EADDRINUSE (Linux, BSD)
+            print(f"Port {port} is already in use — assuming yth serve is "
+                  f"already running. Nothing to do.")
+            return
+        raise
+    print(f"Serving on http://127.0.0.1:{port}  (likes sync every {sync_minutes}m, "
+          f"{SERVE_WINDOW_DAYS}-day window)")
+    srv.serve_forever()
+
+
+def cmd_terms(conn, channel, add, remove):
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if add:
+        if not channel:
+            sys.exit("--add needs --channel")
+        for pair in add:
+            if "=" not in pair:
+                sys.exit(f"expected WRONG=RIGHT, got {pair!r}")
+            wrong, right = (x.strip() for x in pair.split("=", 1))
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_terms (channel, wrong, right, added_at)"
+                " VALUES (?,?,?,?)", (channel, wrong, right, now))
+        conn.commit()
+        print(f"Added {len(add)} repair(s) for {channel}.")
+    if remove:
+        if not channel:
+            sys.exit("--remove needs --channel")
+        conn.execute("DELETE FROM channel_terms WHERE channel = ? AND wrong = ?",
+                     (channel, remove))
+        conn.commit()
+        print(f"Removed {remove!r} from {channel}.")
+
+    rows = conn.execute(
+        "SELECT channel, wrong, right FROM channel_terms"
+        + (" WHERE channel = ?" if channel else "")
+        + " ORDER BY channel, wrong", (channel,) if channel else ()).fetchall()
+    if not rows:
+        print("No repairs configured." if not channel else f"No repairs for {channel}.")
+        return
+    current = None
+    for r in rows:
+        if r["channel"] != current:
+            current = r["channel"]
+            print(f"\n{current}:")
+        print(f"  {r['wrong']:<20} -> {r['right']}")
+
+
+def cmd_resync(conn):
+    """Re-stamp every row so connected clients pull it again.
+
+    Needed whenever a new field is added: clients track a row_updated cursor, so
+    rows they have already consumed are never re-sent, even though the payload
+    now carries more than it did when they consumed it.
+    """
+    # Stagger the stamps. Clients page with "row_updated > cursor", and the
+    # cursor is the last row of a page -- so if every row shared one timestamp
+    # the cursor could never advance past the first page, and the rest would
+    # never be delivered.
+    # Unwatched tracked notices are skipped: re-stamping them would permanently
+    # convert every Tracked row into History content, which is exactly what the
+    # zero stamp at insert time exists to prevent. This is a maintenance command
+    # reached for after a schema bump, so the mistake would be silent.
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    cur = conn.execute(
+        "UPDATE videos AS v SET row_updated = ? + rowid WHERE NOT " + UNWATCHED_TRACKED,
+        (now,))
+    conn.commit()
+    print(f"Re-stamped {cur.rowcount} rows. Connected extensions will re-pull "
+          f"them on their next sync (2-minute alarm, or open the History tab).")
+
+
+def cmd_hidden(conn, unhide):
+    """List or restore soft-deleted videos.
+
+    Removal is deliberately permanent — it survives both a likes re-sync and a
+    re-watch — so there has to be a way back that is not hand-written SQL.
+    """
+    if unhide:
+        cur = conn.execute(
+            "UPDATE videos SET hidden = 0, row_updated = ? WHERE video_id = ?",
+            (int(datetime.now(timezone.utc).timestamp() * 1000), unhide))
+        conn.commit()
+        if cur.rowcount:
+            print(f"Restored {unhide}. It reappears in the History tab on the next pull.")
+        else:
+            print(f"No video with id {unhide} in the record.")
+        return
+
+    rows = conn.execute(
+        "SELECT video_id, title, last_seen FROM videos WHERE hidden = 1"
+        " ORDER BY last_seen DESC").fetchall()
+    if not rows:
+        print("Nothing hidden.")
+        return
+    print(f"{len(rows)} hidden:")
+    for r in rows:
+        when = perth_day(r["last_seen"]).strftime("%d %b %H:%M")
+        print(f"  {r['video_id']}  {when}  {(r['title'] or '')[:52]}")
+    print("\nRestore with:  yth hidden --unhide <video_id>")
+
+
+# ---------------------------------------------------------------- cli
+
+def newest_export(quiet=False):
+    files = [f for pattern in DEFAULT_EXPORT_GLOBS for f in glob(pattern)]
+    if quiet and not files:
+        raise SystemExit(1)
+    if not files:
+        searched = "\n  ".join(DEFAULT_EXPORT_GLOBS)
+        sys.exit("No export found. Searched:\n  " + searched +
+                 "\nExport from the extension's options page, or pass a path.")
+    return max(files, key=os.path.getmtime)
+
+
+def main():
+    # --db is accepted both before and after the subcommand, since
+    # `yth report --db X` is the form that comes naturally.
+    # SUPPRESS on the subcommand copy is load-bearing: with a real default the
+    # subparser would overwrite a --db given before the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=argparse.SUPPRESS,
+                        help="SQLite record (default: alongside yth)")
+
+    ap = argparse.ArgumentParser(prog="yth", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=str(DEFAULT_DB),
+                    help="SQLite record (default: alongside yth)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    imp = sub.add_parser("import", parents=[common], help="merge an export into the record")
+    imp.add_argument("file", nargs="?", help="export JSON (default: newest in ~/Downloads)")
+
+    au = sub.add_parser("auth", help="authorise against the YouTube Data API")
+    src = au.add_mutually_exclusive_group(required=True)
+    src.add_argument("--client-secret",
+                     help="OAuth client JSON (Desktop app) from Google Cloud Console")
+    src.add_argument("--from-env", action="store_true",
+                     help="use GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET")
+    au.add_argument("--gmail", action="store_true",
+                    help="authorise sending mail (gmail.send) instead of YouTube "
+                         "read access; stored separately so both can coexist")
+    au.add_argument("--write", action="store_true",
+                    help="authorise MODIFYING the YouTube account (unsubscribe). "
+                         "This scope also permits playlist and video edits, so it "
+                         "is stored separately and used only by the unsub worker")
+    au.add_argument("--port", type=int, default=0,
+                    help="fixed loopback port (needed for Web-application clients; "
+                         "register http://127.0.0.1:<port> as an authorised redirect URI)")
+
+    sl = sub.add_parser("sync-likes", parents=[common],
+                        help="pull liked videos into the record")
+    sl.add_argument("--verbose", action="store_true",
+                    help="report the first page's date span")
+
+    sv = sub.add_parser("serve", parents=[common],
+                        help="run the local sync daemon the extension talks to")
+    sv.add_argument("--port", type=int, default=DEFAULT_PORT)
+    sv.add_argument("--sync-minutes", type=int, default=10,
+                    help="how often to pull liked videos (default 10)")
+
+    ex = sub.add_parser("export-extension", parents=[common],
+                        help="write the record back out in the extension's import format")
+    ex.add_argument("-o", "--out", default="yth-merged.json", help="output file")
+    ex.add_argument("--force", action="store_true",
+                    help="skip the superset safety check")
+
+    bf = sub.add_parser("backfill", parents=[common],
+                        help="fetch missing video descriptions from the API")
+    bf.add_argument("--limit", type=int, default=1000,
+                    help="maximum videos to fetch in this run")
+
+    sm = sub.add_parser("summarise", parents=[common],
+                        help="summarise one video's transcript")
+    sm.add_argument("video_id")
+
+    em = sub.add_parser("email", parents=[common],
+                        help="summarise if needed, then email the summary")
+    em.add_argument("video_id")
+    em.add_argument("--to", help="override the configured recipient")
+    em.add_argument("--force", action="store_true",
+                    help="send again even if this video was already emailed")
+
+    ar = sub.add_parser("article", parents=[common],
+                        help="generate the long-form article for one video")
+    ar.add_argument("video_id")
+
+    vf = sub.add_parser("verify", parents=[common],
+                        help="check an article's entities against the source")
+    vf.add_argument("video_id")
+
+    tm = sub.add_parser("terms", parents=[common],
+                        help="manage per-channel caption repairs")
+    tm.add_argument("--channel", help="channel these terms belong to")
+    tm.add_argument("--add", action="append", metavar="WRONG=RIGHT",
+                    help="add a repair, e.g. --add Besson=Bessent")
+    tm.add_argument("--remove", metavar="WRONG", help="remove a repair")
+
+    tk = sub.add_parser("track", parents=[common],
+                        help="channels to watch for new uploads")
+    tk.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "remove", "refresh", "subs"],
+                    help="default: list")
+    tk.add_argument("value", nargs="?",
+                    help="channel URL, @handle or UC id (for add/remove)")
+
+    sb = sub.add_parser("subs", parents=[common],
+                        help="subscription manager: audit, queue unsubscribes")
+    sb.add_argument("action", nargs="?", default="list",
+                    choices=["list", "sync", "activity", "queue", "cancel",
+                             "drain", "quota"],
+                    help="default: list")
+    sb.add_argument("value", nargs="?",
+                    help="channel id (queue/cancel) or a count (activity/drain)")
+
+    rs = sub.add_parser("resync", parents=[common],
+                        help="force extensions to re-pull every row")
+
+    hd = sub.add_parser("hidden", parents=[common],
+                        help="list or restore videos removed from the History tab")
+    hd.add_argument("--unhide", metavar="VIDEO_ID", help="restore one video")
+
+    rep = sub.add_parser("report", parents=[common], help="render the record")
+    rep.add_argument("--since", default="5d", type=parse_since, metavar="5d",
+                     help="window: 5d, 2w, 36h (default: 5d)")
+    rep.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
+    rep.add_argument("--unplayed-only", action="store_true", help="only videos with no watch time")
+    rep.add_argument("--min-seconds", type=float, default=0.0,
+                     help="hide videos with less watch time than this")
+
+    args = ap.parse_args()
+
+    if args.cmd == "auth":
+        if args.gmail and args.write:
+            sys.exit("--gmail and --write are different accounts and scopes; "
+                     "authorise them one at a time.")
+        if args.write:
+            scope, creds = YOUTUBE_WRITE_SCOPE, WRITE_CREDS_PATH
+        elif args.gmail:
+            scope, creds = GMAIL_SEND_SCOPE, GMAIL_CREDS_PATH
+        else:
+            scope, creds = SCOPE, CREDS_PATH
+        cmd_auth(args.client_secret, from_env=args.from_env, port=args.port,
+                 scope=scope, creds_path=creds)
+        return
+
+    conn = connect(args.db)
+
+    if args.cmd == "sync-likes":
+        cmd_sync_likes(conn, verbose=args.verbose)
+        return
+
+    if args.cmd == "serve":
+        conn.close()
+        cmd_serve(args.db, args.port, args.sync_minutes)
+        return
+
+    if args.cmd == "backfill":
+        total = 0
+        while True:
+            checked, _ = backfill_descriptions(conn, limit=min(200, args.limit - total))
+            if not checked:
+                break
+            total += checked
+            # Must match the pending criteria above, or the loop stops while
+            # dates are still missing.
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM videos"
+                " WHERE description IS NULL OR published_at IS NULL").fetchone()[0]
+            print(f"  {remaining} still missing")
+            if not remaining or total >= args.limit:
+                break
+        # Channel ids are what makes "when did I last watch this channel" exact
+        # rather than a display-name guess, so the same command fills them.
+        while True:
+            found = backfill_channel_ids(conn, limit=200)
+            left = conn.execute("SELECT COUNT(*) FROM videos"
+                                " WHERE channel_id IS NULL").fetchone()[0]
+            print(f"  {left} without a channel id")
+            if not left:
+                break
+            if not found and left:
+                # Everything remaining came back empty from the API; another
+                # pass would ask the same questions and get the same nothing.
+                break
+        return
+
+    if args.cmd == "summarise":
+        cmd_summarise(conn, args.video_id)
+        return
+
+    if args.cmd == "email":
+        cmd_email(conn, args.video_id, args.to, force=args.force)
+        return
+
+    if args.cmd == "article":
+        cmd_article(conn, args.video_id)
+        return
+
+    if args.cmd == "verify":
+        cmd_verify(conn, args.video_id)
+        return
+
+    if args.cmd == "terms":
+        cmd_terms(conn, args.channel, args.add, args.remove)
+        return
+
+    if args.cmd == "track":
+        if args.action in ("add", "remove") and not args.value:
+            sys.exit(f"track {args.action} needs a channel URL, @handle or UC id")
+        cmd_track(conn, args.action, args.value)
+        return
+
+    if args.cmd == "subs":
+        if args.action == "queue" and not args.value:
+            sys.exit("subs queue needs a channel id")
+        cmd_subs(conn, args.action, args.value)
+        return
+
+    if args.cmd == "resync":
+        cmd_resync(conn)
+        return
+
+    if args.cmd == "hidden":
+        cmd_hidden(conn, args.unhide)
+        return
+
+    if args.cmd == "export-extension":
+        cmd_export_extension(conn, args.out, force=args.force)
+        return
+
+    if args.cmd == "import":
+        path = args.file or newest_export()
+        try:
+            new_v, new_s, new_e, tot_v, tot_s, tot_e = do_import(conn, path)
+        except ExportFormatError as exc:
+            sys.exit(f"Refusing to import {path}: {exc}")
+        print(f"Imported {path}")
+        print(f"  +{new_v} videos (of {tot_v} in export)")
+        print(f"  +{new_s} sessions (of {tot_s} in export)")
+        if tot_e:
+            print(f"  +{new_e} watch events (of {tot_e} in export)")
+        return
+
+    since_counts, unit = args.since
+    since_text = {"d": f"{since_counts['d']} days", "w": f"{since_counts['w'] // 7} weeks",
+                  "h": f"{since_counts['h']} hours"}[unit]
+    rows = gather(conn, window_start_ms(args.since))
+
+    if args.unplayed_only:
+        # "unplayed" means opened in the browser and never started. A video
+        # known only from a like was probably watched on the phone, so it isn't
+        # unplayed — it's unmeasured.
+        rows = [r for r in rows
+                if r["window_watch_seconds"] <= 0 and not r["liked"]]
+    if args.min_seconds:
+        rows = [r for r in rows if r["window_watch_seconds"] >= args.min_seconds]
+
+    if args.json:
+        print(json.dumps({"window": since_text, "timezone": "Australia/Perth (UTC+8)",
+                          "generated_at": datetime.now(PERTH).isoformat(),
+                          "count": len(rows), "videos": rows}, indent=2))
+    else:
+        print(render_markdown(rows, since_text), end="")
+
+
+if __name__ == "__main__":
+    main()

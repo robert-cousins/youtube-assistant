@@ -1,0 +1,26 @@
+diff --git a/src/content.js b/src/content.js
+index 684e155..b84c8b4 100644
+--- a/src/content.js
++++ b/src/content.js
+@@ -1486,6 +1486,21 @@ document.addEventListener('visibilitychange', () => {
+     saveProgressImmediate();
+   }
+ });
++// YouTube navigates in-app via the History API, so the URL is already the new
++// one by the time the MutationObserver below notices the change — saving there
++// would write the OLD player state against the NEW video id. 'yt-navigate-start'
++// fires *before* the navigation commits, while location, document.title and the
++// <video> element all still describe the page being left.
++//
++// This is what captures a video that was opened but never played: the polling
++// saveProgress() bails on video.paused, and saveProgressImmediate() has no such
++// guard. Without this, opening a video and clicking straight to another one
++// records nothing, and leaves orphaned watchSessions rows for videos played for
++// less than one poll interval.
++document.addEventListener('yt-navigate-start', () => {
++  saveProgressImmediate();
++});
++
+ window.addEventListener('popstate', () => {
+   flushActiveWatchTime(null, watchTrackingVideoId, watchTrackingState);
+   saveProgressImmediate();

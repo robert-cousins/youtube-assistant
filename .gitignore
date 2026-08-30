@@ -1,0 +1,16 @@
+# The record itself — personal viewing history. Never commit it.
+history.db
+*.db
+history.db-shm
+history.db-wal
+
+# Generated from your own account; a list of everything you subscribe to.
+subscription-audit.md
+
+# Credentials live in ~/.config/yth/. Guard against a stray copy landing here.
+client_secret*.json
+credentials*.json
+daemon-token
+
+__pycache__/
+*.pyc

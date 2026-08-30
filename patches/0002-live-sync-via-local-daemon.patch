@@ -1,0 +1,331 @@
+diff --git a/src/background.js b/src/background.js
+index 718103a..2e5a9cf 100644
+--- a/src/background.js
++++ b/src/background.js
+@@ -14,6 +14,106 @@ if (typeof importScripts === 'function') {
+   importScripts('db.js');
+ }
+ 
++
++//  yth sync bridge 
++// Cross-profile and phone activity cannot reach this profile's IndexedDB on
++// its own. A small local daemon (yth serve) holds the shared record: we push
++// what we capture, and pull what the other profile and the likes sync added.
++// Everything degrades to normal local-only behaviour if the daemon is down.
++
++const YTH_DEFAULT_URL = 'http://127.0.0.1:8742';
++
++const ythConfig = () => new Promise((resolve) => {
++  chrome.storage.local.get({ ythUrl: YTH_DEFAULT_URL, ythToken: '', ythCursor: 0 }, resolve);
++});
++
++const ythFetch = (cfg, path, options = {}) => fetch(cfg.ythUrl + path, {
++  ...options,
++  headers: { 'Content-Type': 'application/json', 'X-YTH-Token': cfg.ythToken,
++             ...(options.headers || {}) }
++});
++
++// Fire-and-forget: a dead daemon must never block or break local capture.
++const ythPush = (videos = [], sessions = [], events = []) => {
++  ythConfig().then((cfg) => {
++    if (!cfg.ythToken) return;
++    return ythFetch(cfg, '/ingest', {
++      method: 'POST',
++      body: JSON.stringify({ videos, sessions, events })
++    });
++  }).catch(() => { /* offline or daemon down — local capture already succeeded */ });
++};
++
++// Merge a record from the daemon into IndexedDB. db_saveVideo uses put(), i.e.
++// insert-or-replace, so writing the remote record directly would wipe local
++// playback progress. Local watch state always wins; the remote row only fills
++// gaps and contributes the liked flag.
++const ythMergeVideo = (remote) => new Promise((resolve) => {
++  db_getVideoById(remote.videoId).then((existing) => {
++    if (!existing) {
++      resolve(db_saveVideo({
++        videoId: remote.videoId,
++        title: remote.title || '',
++        channel: remote.channel || '',
++        channelUrl: remote.channelUrl || '',
++        time: remote.time || 0,
++        duration: remote.duration || 0,
++        watched: remote.watched === true,
++        watchCount: remote.watchCount || 0,
++        live: remote.live === true ? true : undefined,
++        liveReplay: remote.liveReplay === true ? true : undefined,
++        liked: remote.liked === true ? true : undefined,
++        hidden: remote.hidden === true ? true : undefined,
++        timestamp: remote.timestamp || Date.now()
++      }));
++      return;
++    }
++    resolve(db_saveVideo({
++      ...existing,
++      title:      existing.title      || remote.title || '',
++      channel:    existing.channel    || remote.channel || '',
++      channelUrl: existing.channelUrl || remote.channelUrl || '',
++      duration:   existing.duration   || remote.duration || 0,
++      // Monotonic locally-owned facts: never regress them from a remote row.
++      time:       Math.max(existing.time || 0, remote.time || 0),
++      watchCount: Math.max(existing.watchCount || 0, remote.watchCount || 0),
++      watched:    existing.watched === true || remote.watched === true,
++      liked:      remote.liked === true ? true : existing.liked,
++      hidden:     remote.hidden === true ? true : undefined,
++      // timestamp drives History-tab sort order. Only move it forward, so a
++      // video watched here last week is not shuffled to when it was liked.
++      timestamp:  Math.max(existing.timestamp || 0, remote.timestamp || 0)
++    }));
++  }).catch(() => resolve());
++});
++
++let ythPulling = null;
++
++const ythPull = () => {
++  if (ythPulling) return ythPulling;                 // collapse concurrent pulls
++  ythPulling = ythConfig().then((cfg) => {
++    if (!cfg.ythToken) return { skipped: true };
++    return ythFetch(cfg, `/recent?since=${cfg.ythCursor || 0}`)
++      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
++      .then((data) => {
++        const videos = data.videos || [];
++        return videos.reduce(
++          (chain, v) => chain.then(() => ythMergeVideo(v)), Promise.resolve()
++        ).then(() => {
++          if (data.cursor) chrome.storage.local.set({ ythCursor: data.cursor });
++          if (videos.length) invalidateCountCache?.();
++          return { merged: videos.length, cursor: data.cursor };
++        });
++      });
++  }).catch((error) => ({ error: String(error) }))
++    .then((result) => { ythPulling = null; return result; });
++  return ythPulling;
++};
++
++chrome.alarms.get('yth-pull', (existing) => {
++  if (!existing) chrome.alarms.create('yth-pull', { periodInMinutes: 2 });
++});
++
+ // Message handlers
+ 
+ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+@@ -54,16 +154,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+ 
+   if (message.type === 'idb-save-video') {
+     db_saveVideo(message.video).catch(console.error);
++    ythPush([message.video]);
+     return;
+   }
+ 
+   if (message.type === 'idb-record-watch-event') {
+     db_recordWatchEvent(message.watchEvent).catch(console.error);
++    ythPush([], [], [message.watchEvent]);
+     return;
+   }
+ 
++  if (message.type === 'yth-hide') {
++    // Soft-delete in the shared record so the video stays gone: a local-only
++    // delete would be undone by the next pull, since the row is still in the
++    // daemon's database and still in the likes playlist.
++    ythConfig().then((cfg) => {
++      if (!cfg.ythToken) return { skipped: true };   // sync off: local delete is final
++      return ythFetch(cfg, '/hide', {
++        method: 'POST',
++        body: JSON.stringify({ videoId: message.videoId })
++      }).then((r) => (r.ok ? { hidden: true } : { error: 'HTTP ' + r.status }));
++    }).then(sendResponse).catch((e) => sendResponse({ error: String(e) }));
++    return true;
++  }
++
++  if (message.type === 'yth-pull-now') {
++    // The History page asks for this on load so a refresh is always current.
++    ythPull().then(sendResponse);
++    return true;
++  }
++
+   if (message.type === 'idb-record-watch-session') {
+     db_recordWatchSession(message.watchSession).catch(console.error);
++    ythPush([], [message.watchSession]);
+     return;
+   }
+ 
+@@ -124,6 +247,7 @@ const BACKUP_FREQUENCY_MS = {
+ // Alarm dispatcher
+ 
+ chrome.alarms.onAlarm.addListener((alarm) => {
++  if (alarm.name === 'yth-pull') ythPull();
+   if (alarm.name === 'backup-reminder-check') {
+     chrome.storage.local.get(
+       { backupReminderFrequency: 'weekly', lastBackupTimestamp: 0 },
+diff --git a/src/history.js b/src/history.js
+index b999644..9221beb 100644
+--- a/src/history.js
++++ b/src/history.js
+@@ -30,6 +30,7 @@ const applyFilters = () => {
+   const sort = sortSelect.value;
+ 
+   filteredHistory = allHistory.filter(v => {
++    if (v.hidden) return false;                 // soft-deleted in the shared record
+     if (hideWatched && v.watched) return false;
+     if (query) {
+       return v.title.toLowerCase().includes(query) ||
+@@ -88,7 +89,13 @@ const renderBatch = () => {
+         ? `\u{1F504} Livestream \u2022 ${liveTime}`
+         : video.watched
+           ? '\u2713 Watched'
+-          : formatTime(video.time);
++          : (video.liked && !video.time)
++            // Liked elsewhere (phone, other profile): we have no watch time for
++            // it, and showing 0:00 would read as "opened and abandoned".
++            ? '\u2605 Liked'
++            : video.liked
++              ? `\u2605 ${formatTime(video.time)}`
++              : formatTime(video.time);
+ 
+     const card = document.createElement('div');
+     card.className = 'video-card';
+@@ -158,10 +165,19 @@ const renderBatch = () => {
+     removeItem.className = 'card-menu-item danger';
+     removeItem.textContent = '\uD83D\uDDD1 Remove from history';
+     removeItem.onclick = () => {
+-      db_deleteVideo(video.videoId).then(() => {
+-        showToast('Video removed');
+-        loadHistory();
+-      }).catch(console.error);
++      // Hide in the shared record first. Deleting locally on its own is not
++      // enough once syncing is on -- the next pull would bring the video
++      // straight back, and for a liked video every future likes sync would too.
++      chrome.runtime.sendMessage({ type: 'yth-hide', videoId: video.videoId }, (result) => {
++        void chrome.runtime.lastError;
++        const syncFailed = result && result.error;
++        db_deleteVideo(video.videoId).then(() => {
++          showToast(syncFailed
++            ? 'Removed here, but the sync daemon is unreachable - it may come back'
++            : 'Video removed');
++          loadHistory();
++        }).catch(console.error);
++      });
+     };
+ 
+     cardMenu.appendChild(watchedItem);
+@@ -219,6 +235,16 @@ const renderBatch = () => {
+ };
+ 
+ const loadHistory = () => {
++  // Ask the background worker to pull anything new from the local daemon first
++  // (other Chrome profile, phone likes), then read IndexedDB. If the daemon is
++  // down this resolves immediately and we simply render what is local.
++  chrome.runtime.sendMessage({ type: 'yth-pull-now' }, () => {
++    void chrome.runtime.lastError;                 // daemon absent is not an error
++    loadHistoryFromDb();
++  });
++};
++
++const loadHistoryFromDb = () => {
+   // Fetch all records from IndexedDB for client-side filtering/sorting.
+   // db_getAllVideos() returns them newest-first; applyFilters() may re-sort.
+   db_getAllVideos().then((videos) => {
+@@ -261,7 +287,10 @@ document.addEventListener('click', () => {
+ });
+ 
+ document.getElementById('clear-all').onclick = () => {
+-  if (confirm('Permanently delete your entire local history?')) {
++  if (confirm('Permanently delete your entire local history?\n\n'
++      + 'Note: anything held by the sync daemon (other Chrome profile, liked '
++      + 'videos) will return on the next pull. Stop `yth serve`, or clear the '
++      + 'token in Options, if you want this to stick.')) {
+     db_clearAllVideos().then(() => {
+       // Keep the videoCount in sync so the popup stat updates promptly.
+       chrome.storage.local.set({ videoCount: 0 });
+diff --git a/src/manifest.json b/src/manifest.json
+index e2a908d..06e60c0 100644
+--- a/src/manifest.json
++++ b/src/manifest.json
+@@ -1,6 +1,6 @@
+ {
+   "manifest_version": 3,
+-  "name": "WatchHistory for YouTube™",
++  "name": "WatchHistory for YouTube\u2122",
+   "short_name": "WatchHistory",
+   "version": "1.2.2",
+   "description": "Track your YouTube history locally. Resume videos where you left off. Perfect for privacy-conscious users.",
+@@ -16,7 +16,8 @@
+     "alarms"
+   ],
+   "host_permissions": [
+-    "https://www.youtube.com/*"
++    "https://www.youtube.com/*",
++    "http://127.0.0.1/*"
+   ],
+   "action": {
+     "default_popup": "popup.html",
+diff --git a/src/options.html b/src/options.html
+index e0ab380..cb3a81f 100644
+--- a/src/options.html
++++ b/src/options.html
+@@ -210,6 +210,24 @@
+           <option value="monthly">Monthly</option>
+         </select>
+       </div>
++      <div class="panel-row" id="yth-section">
++        <div>
++          <label>Sync daemon</label>
++          <div class="help-text">
++            Shares history with your other Chrome profile and pulls in videos you
++            liked on your phone. Run <code>yth serve</code>, then paste the token
++            it prints. Leave the token blank to disable syncing entirely.
++          </div>
++          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
++            <input id="yth-url" type="text" placeholder="http://127.0.0.1:8742"
++                   style="flex:1;min-width:200px;padding:6px 8px" />
++            <input id="yth-token" type="password" placeholder="daemon token"
++                   style="flex:1;min-width:200px;padding:6px 8px" />
++            <button id="yth-test" class="btn btn-sm">Test</button>
++          </div>
++          <div class="help-text" id="yth-status" style="margin-top:6px"></div>
++        </div>
++      </div>
+       <div class="panel-row" id="export-section">
+         <div>
+           <label>Export history/Take Backup</label>
+diff --git a/src/options.js b/src/options.js
+index 40c7bdb..164827d 100644
+--- a/src/options.js
++++ b/src/options.js
+@@ -494,3 +494,36 @@ chrome.storage.onChanged.addListener((changes, area) => {
+     document.documentElement.dataset.theme = changes.youtubeTheme.newValue;
+   }
+ });
++
++
++//  yth daemon settings 
++// The daemon is what makes the other Chrome profile and phone likes visible
++// here. Token comes from `yth serve` (also at ~/.config/yth/daemon-token).
++(() => {
++  const url = document.getElementById('yth-url');
++  const token = document.getElementById('yth-token');
++  const status = document.getElementById('yth-status');
++  if (!url || !token) return;
++
++  chrome.storage.local.get({ ythUrl: 'http://127.0.0.1:8742', ythToken: '' }, (cfg) => {
++    url.value = cfg.ythUrl;
++    token.value = cfg.ythToken;
++  });
++
++  const save = () => chrome.storage.local.set({
++    ythUrl: url.value.trim() || 'http://127.0.0.1:8742',
++    ythToken: token.value.trim()
++  });
++  url.onchange = save;
++  token.onchange = save;
++
++  const testBtn = document.getElementById('yth-test');
++  if (testBtn) testBtn.onclick = () => {
++    save();
++    status.textContent = 'Checking...';
++    fetch(url.value.trim() + '/recent?since=0', { headers: { 'X-YTH-Token': token.value.trim() } })
++      .then((r) => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
++      .then((d) => { status.textContent = `Connected — ${d.count} record(s) waiting.`; })
++      .catch((e) => { status.textContent = `Not reachable: ${e.message}. Is \`yth serve\` running?`; });
++  };
++})();
