@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>WatchHistory for YouTube™ - History</title>
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    .search-bar {
+      padding: 12px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .search-bar input {
+      flex: 1;
+    }
+
+    .sort-select {
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-pill);
+      padding: 8px 14px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .hide-watched-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .hide-watched-label input {
+      cursor: pointer;
+      accent-color: var(--accent);
+    }
+
+    .load-more-wrap {
+      display: flex;
+      justify-content: center;
+      padding: 24px;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Header -->
+  <div class="page-header">
+    <div class="logo">
+      <div class="logo-icon">WHYT</div>
+      <div class="logo-text">WatchHistory <span>for YouTube™</span></div>
+    </div>
+    <nav class="nav-tabs">
+      <a href="history.html" class="nav-tab active">History</a>
+      <a href="tracked.html" class="nav-tab">Tracked</a>
+      <a href="subscriptions.html" class="nav-tab">Subscriptions</a>
+      <a href="stats.html" class="nav-tab">Stats</a>
+      <a href="options.html" class="nav-tab">Options</a>
+      <a href="https://www.youtube.com" class="nav-tab" target="_blank" rel="noopener noreferrer">YouTube</a>
+    </nav>
+    <div class="page-header-actions">
+      <button id="clear-all" class="btn btn-danger btn-sm">Clear All</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stat-bar">
+    <span class="stat-item">Showing: <strong id="stat-shown">0</strong></span>
+    <span class="stat-item">Total Archived: <strong id="stat-total">0</strong></span>
+  </div>
+
+  <!-- Search & Filter -->
+  <div class="search-bar">
+    <input type="text" id="search-input" class="input input-search" placeholder="Search by title or channel...">
+    <label class="hide-watched-label">
+      <input type="checkbox" id="hide-watched-toggle">
+      <span>Hide watched</span>
+    </label>
+    <label class="hide-watched-label" for="window-select">Show</label>
+    <select id="window-select" class="sort-select">
+      <option value="14">Last 2 weeks</option>
+      <option value="30">Last month</option>
+      <option value="90">Last 3 months</option>
+      <option value="365">Last year</option>
+      <option value="0">Everything</option>
+    </select>
+    <label class="hide-watched-label" for="theme-select">Theme</label>
+    <select id="theme-select" class="sort-select">
+      <option value="auto">Match YouTube</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <label class="hide-watched-label" for="thumb-size-select">Thumbnails</label>
+    <select id="thumb-size-select" class="sort-select">
+      <option value="small">Small</option>
+      <option value="medium">Medium</option>
+      <option value="large">Large</option>
+    </select>
+    <select id="sort-select" class="sort-select">
+      <option value="newest">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="title">Title A–Z</option>
+    </select>
+  </div>
+
+  <!-- Video rows (one per line; size class set from the Thumbnails control) -->
+  <div id="history-container" class="video-rows thumb-medium"></div>
+
+  <!-- Load More -->
+  <div class="load-more-wrap">
+    <button id="load-more-btn" class="btn hidden">Load More</button>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <!-- Footer -->
+  <div
+    style="text-align: center; padding: 16px 20px; border-top: 1px solid var(--border-color); color: var(--text-secondary); font-size: 12px;">
+    <a href="https://github.com/GeorgeElliott/yt-watch-history" target="_blank"
+      style="color: var(--accent); text-decoration: none;">View on GitHub</a>
+    <span style="margin: 0 8px; opacity: 0.4;">|</span>
+    <a href="https://github.com/GeorgeElliott/yt-watch-history/issues" target="_blank" rel="noopener noreferrer"
+      style="color: var(--accent); text-decoration: none;">Report a Bug</a>
+  </div>
+
+  <script src="openlink.js"></script>
+  <script src="db.js"></script>
+  <script src="history.js"></script>
+</body>
+
+</html>

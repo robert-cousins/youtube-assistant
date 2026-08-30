@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>WatchHistory for YouTube™ - Subscriptions</title>
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    .search-bar {
+      padding: 12px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .search-bar input.input-search { flex: 1; min-width: 180px; }
+
+    .sort-select {
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-pill);
+      padding: 8px 14px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .inline-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    /* Provenance note. "Last viewed" mostly means "last liked" -- real watch
+       data only exists since the extension was installed -- and a column that
+       silently means something other than its label is how you end up trusting
+       a confident wrong number. */
+    .caveat {
+      padding: 10px 20px;
+      background: var(--accent-surface);
+      border-bottom: 1px solid var(--border-color);
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    .caveat strong { color: var(--text-primary); }
+
+    /* Queue state. Irreversible work that has not happened yet, so it is
+       always visible and always cancellable. */
+    .queue-bar {
+      padding: 10px 20px;
+      background: var(--bg-primary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 13px;
+      flex-wrap: wrap;
+    }
+
+    .queue-bar .spacer { flex: 1; }
+    .queue-bar.is-idle { display: none; }
+
+    .queue-count {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .budget-warn {
+      color: #ff4d4d;
+      font-weight: 600;
+    }
+
+    .load-more-wrap { display: flex; justify-content: center; padding: 24px; }
+
+    /* Channel avatars are square, unlike video thumbnails. */
+    .video-rows.is-subs .video-card .thumb-link {
+      width: var(--thumb-w);
+      aspect-ratio: 1 / 1;
+      border-radius: 50%;
+      overflow: hidden;
+      justify-self: center;
+    }
+
+    .video-rows.is-subs { --thumb-w: 72px; }
+    .video-rows.is-subs.thumb-small  { --thumb-w: 48px; }
+    .video-rows.is-subs.thumb-medium { --thumb-w: 72px; }
+    .video-rows.is-subs.thumb-large  { --thumb-w: 104px; }
+
+    .video-rows.is-subs .video-card {
+      grid-template-columns: var(--thumb-w) auto minmax(0, 34ch) minmax(0, 1fr) auto;
+    }
+
+    .sub-facts {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .sub-dormant { color: #d98324; font-weight: 600; }
+    .sub-never { color: var(--text-secondary); }
+    .sub-queued { color: #ff4d4d; font-weight: 600; }
+  </style>
+</head>
+
+<body>
+  <div class="page-header">
+    <div class="logo">
+      <div class="logo-icon">WHYT</div>
+      <div class="logo-text">WatchHistory <span>for YouTube™</span></div>
+    </div>
+    <nav class="nav-tabs">
+      <a href="history.html" class="nav-tab">History</a>
+      <a href="tracked.html" class="nav-tab">Tracked</a>
+      <a href="subscriptions.html" class="nav-tab active">Subscriptions</a>
+      <a href="stats.html" class="nav-tab">Stats</a>
+      <a href="options.html" class="nav-tab">Options</a>
+      <a href="https://www.youtube.com" class="nav-tab" target="_blank" rel="noopener noreferrer">YouTube</a>
+    </nav>
+    <div class="page-header-actions">
+      <button id="sync-btn" class="btn btn-sm">Sync from YouTube</button>
+    </div>
+  </div>
+
+  <div class="stat-bar">
+    <span class="stat-item">Showing: <strong id="stat-shown">0</strong></span>
+    <span class="stat-item">Subscribed: <strong id="stat-total">0</strong></span>
+    <span class="stat-item">Never viewed: <strong id="stat-never">0</strong></span>
+    <span class="stat-item">Dormant: <strong id="stat-dormant">0</strong></span>
+    <span class="stat-item" id="stat-removed"></span>
+    <span class="stat-item" id="stat-quota"></span>
+  </div>
+
+  <div class="caveat">
+    <strong>What “last viewed” actually measures.</strong>
+    Watch data only exists from when the extension was installed. Anything older is
+    inferred from your <strong>likes</strong>, which go back to 2015 — so each row says
+    which it is. A channel you watch often but never like will show as
+    <em>never viewed</em>. Treat it as a strong hint, not a verdict.
+  </div>
+
+  <div id="queue-bar" class="queue-bar is-idle">
+    <span><span class="queue-count" id="queue-count">0</span> queued to unsubscribe</span>
+    <span id="queue-rate"></span>
+    <span class="spacer"></span>
+    <button id="cancel-all-btn" class="btn btn-sm btn-danger">Cancel all queued</button>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="search-input" class="input input-search" placeholder="Search subscriptions...">
+    <select id="filter-select" class="sort-select">
+      <option value="all">All</option>
+      <option value="never">Never viewed</option>
+      <option value="dormant">Dormant channels</option>
+      <option value="queued">Queued to unsubscribe</option>
+      <option value="removed">Removed</option>
+      <option value="tracked">Tracked</option>
+    </select>
+    <select id="sort-select" class="sort-select">
+      <option value="viewed">Least recently viewed</option>
+      <option value="upload">Least recently posted</option>
+      <option value="subscribed">Longest subscribed</option>
+      <option value="likes">Most liked</option>
+      <option value="title">Name A–Z</option>
+    </select>
+    <label class="inline-label" for="theme-select">Theme</label>
+    <select id="theme-select" class="sort-select">
+      <option value="auto">Match YouTube</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <label class="inline-label" for="thumb-size-select">Avatars</label>
+    <select id="thumb-size-select" class="sort-select">
+      <option value="small">Small</option>
+      <option value="medium">Medium</option>
+      <option value="large">Large</option>
+    </select>
+  </div>
+
+  <div id="subs-container" class="video-rows is-subs thumb-medium"></div>
+
+  <div class="load-more-wrap">
+    <button id="load-more-btn" class="btn hidden">Load More</button>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="openlink.js"></script>
+  <script src="subscriptions.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <title>WatchHistory for YouTube™ - Tracked</title>
+  <link rel="stylesheet" href="theme.css">
+  <style>
+    .search-bar {
+      padding: 12px 20px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .search-bar input.input-search { flex: 1; min-width: 200px; }
+
+    .sort-select {
+      background: var(--bg-input);
+      color: var(--text-primary);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-pill);
+      padding: 8px 14px;
+      font-family: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .inline-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .inline-label input[type="checkbox"] { cursor: pointer; accent-color: var(--accent); }
+
+    /* Channel manager. Collapsed by default so the notice list is what you see
+       first -- adding channels is occasional, reading the list is constant. */
+    .channel-bar {
+      padding: 12px 20px;
+      background: var(--bg-primary);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .channel-bar.collapsed .channel-body { display: none; }
+
+    .channel-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .channel-head .spacer { flex: 1; }
+
+    .channel-body { margin-top: 12px; }
+
+    .channel-add {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    .channel-add input { flex: 1; min-width: 240px; }
+
+    .channel-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .channel-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-pill);
+      padding: 5px 6px 5px 12px;
+      font-size: 12px;
+      color: var(--text-primary);
+      max-width: 320px;
+    }
+
+    .channel-chip .chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .channel-chip .chip-count {
+      color: var(--text-secondary);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .channel-chip .chip-remove {
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-size: 15px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 50%;
+    }
+
+    .channel-chip .chip-remove:hover { background: var(--danger, #d33); color: #fff; }
+
+    .channel-chip.has-error { border-color: var(--danger, #d33); }
+
+    /* Subscriptions picker. 693 rows, so it is a scrolling filtered list
+       rather than anything that tries to show them all at once. */
+    .subs-panel {
+      margin-top: 12px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--bg-secondary);
+      padding: 10px;
+    }
+
+    .subs-list {
+      max-height: 260px;
+      overflow-y: auto;
+      margin-top: 8px;
+    }
+
+    .subs-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 5px 6px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+
+    .subs-row:hover { background: var(--bg-hover, rgba(128, 128, 128, 0.12)); }
+
+    .subs-row .subs-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .load-more-wrap { display: flex; justify-content: center; padding: 24px; }
+
+    .published-flag {
+      font-size: 11px;
+      color: var(--accent);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="page-header">
+    <div class="logo">
+      <div class="logo-icon">WHYT</div>
+      <div class="logo-text">WatchHistory <span>for YouTube™</span></div>
+    </div>
+    <nav class="nav-tabs">
+      <a href="history.html" class="nav-tab">History</a>
+      <a href="tracked.html" class="nav-tab active">Tracked</a>
+      <a href="subscriptions.html" class="nav-tab">Subscriptions</a>
+      <a href="stats.html" class="nav-tab">Stats</a>
+      <a href="options.html" class="nav-tab">Options</a>
+      <a href="https://www.youtube.com" class="nav-tab" target="_blank" rel="noopener noreferrer">YouTube</a>
+    </nav>
+    <div class="page-header-actions">
+      <button id="refresh-btn" class="btn btn-sm">Refresh</button>
+    </div>
+  </div>
+
+  <div class="stat-bar">
+    <span class="stat-item">New: <strong id="stat-new">0</strong></span>
+    <span class="stat-item">Channels: <strong id="stat-channels">0</strong></span>
+    <span class="stat-item" id="stat-checked">Never checked</span>
+  </div>
+
+  <!-- Channel manager -->
+  <div id="channel-bar" class="channel-bar collapsed">
+    <div class="channel-head">
+      <button id="channel-toggle" class="btn btn-sm">Manage channels</button>
+      <span id="channel-summary"></span>
+      <span class="spacer"></span>
+    </div>
+    <div class="channel-body">
+      <div class="channel-add">
+        <input type="text" id="channel-input" class="input"
+               placeholder="Channel URL, @handle or UC… id">
+        <button id="channel-add-btn" class="btn btn-sm btn-primary">Track</button>
+        <button id="subs-btn" class="btn btn-sm">From subscriptions</button>
+      </div>
+      <div id="channel-chips" class="channel-chips"></div>
+      <div id="subs-panel" class="subs-panel hidden">
+        <input type="text" id="subs-filter" class="input input-search"
+               placeholder="Filter subscriptions…">
+        <div id="subs-list" class="subs-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="search-input" class="input input-search"
+           placeholder="Search by title or channel...">
+    <label class="inline-label">
+      <input type="checkbox" id="show-cleared-toggle">
+      <span>Show cleared</span>
+    </label>
+    <label class="inline-label" for="theme-select">Theme</label>
+    <select id="theme-select" class="sort-select">
+      <option value="auto">Match YouTube</option>
+      <option value="light">Light</option>
+      <option value="dark">Dark</option>
+    </select>
+    <label class="inline-label" for="thumb-size-select">Thumbnails</label>
+    <select id="thumb-size-select" class="sort-select">
+      <option value="small">Small</option>
+      <option value="medium">Medium</option>
+      <option value="large">Large</option>
+    </select>
+    <select id="sort-select" class="sort-select">
+      <option value="newest">Newest first</option>
+      <option value="oldest">Oldest first</option>
+      <option value="channel">Channel A–Z</option>
+    </select>
+  </div>
+
+  <div id="tracked-container" class="video-rows thumb-medium"></div>
+
+  <div class="load-more-wrap">
+    <button id="load-more-btn" class="btn hidden">Load More</button>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="openlink.js"></script>
+  <script src="tracked.js"></script>
+</body>
+
+</html>
