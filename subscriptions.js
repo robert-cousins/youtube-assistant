@@ -25,6 +25,7 @@ const statTotal   = document.getElementById('stat-total');
 const statNever   = document.getElementById('stat-never');
 const statDormant = document.getElementById('stat-dormant');
 const statQuota   = document.getElementById('stat-quota');
+const statRemoved = document.getElementById('stat-removed');
 
 let allSubs = [];
 let filtered = [];
@@ -143,6 +144,12 @@ const applyFilters = () => {
   const sort = sortSelect.value;
 
   filtered = allSubs.filter((s) => {
+    // Removed channels drop out of every view but their own. The row is kept
+    // in the record rather than deleted, because an irreversible change made
+    // on your behalf -- possibly days after you asked for it -- should stay
+    // auditable; it just should not clutter the list you are still triaging.
+    if (mode === 'removed') return !s.present;
+    if (!s.present) return false;
     if (mode === 'never' && s.lastViewedKind !== 'never') return false;
     if (mode === 'dormant' && !isDormant(s)) return false;
     if (mode === 'queued' && s.unsubState !== 'queued') return false;
@@ -187,12 +194,16 @@ const renderBatch = () => {
     icon.textContent = '📻';
     const text = document.createElement('div');
     text.className = 'empty-text';
-    text.textContent = allSubs.length ? 'Nothing matches' : 'No subscriptions synced yet';
+    text.textContent = filterSelect.value === 'removed'
+      ? 'Nothing removed yet'
+      : (allSubs.length ? 'Nothing matches' : 'No subscriptions synced yet');
     const sub = document.createElement('div');
     sub.className = 'empty-sub';
-    sub.textContent = allSubs.length
-      ? 'Try a different filter or search term'
-      : 'Press "Sync from YouTube" to pull your subscription list';
+    sub.textContent = filterSelect.value === 'removed'
+      ? 'Channels unsubscribed by yth are listed here'
+      : (allSubs.length
+        ? 'Try a different filter or search term'
+        : 'Press "Sync from YouTube" to pull your subscription list');
     empty.append(icon, text, sub);
     container.replaceChildren(empty);
     loadMoreBtn.classList.add('hidden');
@@ -366,6 +377,10 @@ const renderStats = () => {
   statDormant.title = unchecked
     ? `${unchecked} channel(s) not yet checked for upload activity`
     : 'All channels checked';
+  const removed = allSubs.filter((s) => !s.present).length;
+  statRemoved.textContent = removed ? `Removed: ${removed}` : '';
+  statRemoved.title = removed
+    ? 'Hidden from the list. Choose "Removed" in the filter to review them.' : '';
   statQuota.textContent = budget
     ? `Quota: ${budget.used}/${budget.budget} units today` : '';
 };
